@@ -35,25 +35,83 @@ from typing import Iterable
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-# Standards we'll slice by. The full label substring is matched case-insensitively
-# against the manifest's standard_clause field.
+# Standards we slice by. Each entry: (bucket_slug, manifest_column,
+# substring_hints). Per-standard labels are read FIRST from the per-fixture
+# manifest column (populated for TRACE fixtures from their JSON
+# expected_result blocks). For non-TRACE fixtures the column is empty and
+# applicability is inferred from `standard_clause` substring hints, with the
+# fixture's collapsed `expected_label` as the label.
 KNOWN_STANDARDS = [
-    ("wcag2.2-sc2.3.1", ("wcag", "wcag2", "wcag 2", "wcag-2", "wcag2.2")),
-    ("itu-r-bt.1702",   ("itu-r", "bt.1702", "itu_r1702")),
-    ("ofcom-gn2",       ("ofcom",)),
-    ("trace24",         ("trace24",)),
-    ("nab-j",           ("nab-j", "nab_j", "j-ba")),
-    ("iso9241-391",     ("iso9241-391", "iso 9241")),
+    ("wcag2.2-sc2.3.1", "expected_wcag2_2",       ("wcag", "wcag2", "wcag 2", "wcag-2", "wcag2.2")),
+    ("itu-r-bt.1702",   "expected_itu_r1702_4",   ("itu-r", "bt.1702", "itu_r1702")),
+    ("ofcom-gn2",       "expected_ofcom2017",     ("ofcom",)),
+    ("trace24",         "expected_trace24",       ("trace24",)),
+    ("nab-j",           "",                        ("nab-j", "nab_j", "j-ba")),
+    ("iso9241-391",     "expected_iso9241_391",   ("iso9241-391", "iso 9241")),
 ]
 
 
+# Map a tool's reported standard_profile string to the canonical bucket
+# slug from KNOWN_STANDARDS. WCAG2.2-classic and WCAG2.2-SC2.3.1 are two
+# readings of the same standard (see OQ-4) and score against the same
+# fixture-level label.
+PROFILE_TO_STANDARD_SLUG = {
+    "WCAG2.2-SC2.3.1":   "wcag2.2-sc2.3.1",
+    "WCAG2.2-classic":   "wcag2.2-sc2.3.1",
+    "ITU-R-BT.1702":     "itu-r-bt.1702",
+    "Ofcom-GN2-Annex1":  "ofcom-gn2",
+    "Trace24":           "trace24",
+    "NAB-J":             "nab-j",
+}
+
+
+def _per_standard_labels(row: dict) -> dict[str, str]:
+    """Return {standard_slug: 'PASS'|'FAIL'} for this fixture, including only
+    standards that have an explicit label. Reads the per-standard columns
+    populated from TRACE per-fixture JSONs; for non-TRACE fixtures returns
+    the collapsed expected_label keyed under every applicable standard
+    inferred from standard_clause."""
+    out: dict[str, str] = {}
+    for slug, col, _ in KNOWN_STANDARDS:
+        if col:
+            val = (row.get(col) or "").strip()
+            if val in ("PASS", "FAIL"):
+                out[slug] = val
+    if out:
+        return out
+    # Fallback for non-TRACE fixtures: use expected_label as the label
+    # for every standard the standard_clause names. This preserves the
+    # pre-OQ-5 behavior on IRIS / Apple / OURS-extended fixtures.
+    fallback = (row.get("expected_label") or "").strip()
+    if fallback in ("PASS", "FAIL"):
+        clause = (row.get("standard_clause") or "").lower()
+        for slug, _, needles in KNOWN_STANDARDS:
+            if any(n in clause for n in needles):
+                out[slug] = fallback
+    return out
+
+
 def _standards_for_row(row: dict) -> list[str]:
-    clause = (row.get("standard_clause") or "").lower()
-    hits = []
-    for label, needles in KNOWN_STANDARDS:
-        if any(n in clause for n in needles):
-            hits.append(label)
-    return hits or ["unspecified"]
+    """Applicable standards for this fixture, derived from per-standard
+    columns (TRACE) or from standard_clause substring hints (everything
+    else)."""
+    standards = list(_per_standard_labels(row).keys())
+    return standards or ["unspecified"]
+
+
+def _label_for_tool(row: dict, result: dict) -> str:
+    """Return the per-fixture label to score this tool's result against.
+
+    Priority: per-standard label matching the tool's standard_profile,
+    falling back to expected_label if the per-standard column is empty.
+    """
+    profile = result.get("standard_profile") or ""
+    slug = PROFILE_TO_STANDARD_SLUG.get(profile)
+    if slug:
+        per_std = _per_standard_labels(row)
+        if slug in per_std:
+            return per_std[slug]
+    return (row.get("expected_label") or "").strip()
 
 
 def _source_bucket(row: dict) -> str:
@@ -134,8 +192,10 @@ def _aggregate(rows_with_results: list[tuple[dict, dict]]) -> dict[str, Bucket]:
     """
     buckets: dict[str, Bucket] = defaultdict(Bucket)
     for manifest_row, result in rows_with_results:
-        # Skip rows that aren't scoreable.
-        expected = manifest_row["expected_label"]
+        # Select the right label for THIS tool/result based on its
+        # standard_profile -- TRACE fixtures get per-standard labels (OQ-5
+        # resolution); non-TRACE fixtures get expected_label as before.
+        expected = _label_for_tool(manifest_row, result)
         if expected not in ("PASS", "FAIL"):
             continue
         verdict = result["verdict"]

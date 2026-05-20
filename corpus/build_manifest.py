@@ -165,9 +165,24 @@ def derive_iris_video_label(expected_csv: Path) -> tuple[str, list[str], Optiona
 
 # --- Manifest row dataclass ------------------------------------------------
 
+# Per-standard expected-label columns (added 2026-05-20 to resolve OQ-5).
+# TRACE per-fixture JSONs carry one PASS/FAIL per standard; populating
+# these columns lets scoring join each (tool, profile) result against the
+# *specific* standard's label rather than the per-set CSV's collapsed
+# verdict. Non-TRACE fixtures leave these blank and scoring falls back to
+# `expected_label`.
+PER_STANDARD_COLUMNS = [
+    "expected_trace24",
+    "expected_wcag2_2",
+    "expected_ofcom2017",
+    "expected_itu_r1702_4",
+    "expected_iso9241_391",
+]
+
 MANIFEST_COLUMNS = [
     "source", "license", "type", "path",
     "expected_label", "expected_detail_file",
+    *PER_STANDARD_COLUMNS,
     "standard_clause", "frame_rate", "color_space", "dynamic_range",
     "resolution", "codec", "generation_params",
     "provenance_commit", "notes",
@@ -182,6 +197,11 @@ class Row:
     path: str
     expected_label: str
     expected_detail_file: str = ""
+    expected_trace24: str = ""
+    expected_wcag2_2: str = ""
+    expected_ofcom2017: str = ""
+    expected_itu_r1702_4: str = ""
+    expected_iso9241_391: str = ""
     standard_clause: str = ""
     frame_rate: str = ""
     color_space: str = ""
@@ -241,6 +261,14 @@ def trace_rows() -> Iterable[Row]:
                 # this is the "generation_params" the manifest cites so a
                 # reviewer can re-derive the label analytically.
                 gen_params_path = set_dir / f"{stem}.json"
+
+                # Read the per-fixture JSON's expected_result block and
+                # populate per-standard columns. All 306 TRACE fixtures
+                # ship a 5-standard verdict map (trace24, wcag2_2,
+                # ofcom2017, itu_r1702_4, iso); each value is "pass" or
+                # "fail" -- we normalize to "PASS"/"FAIL".
+                per_std = _read_expected_result(gen_params_path)
+
                 yield Row(
                     source="TRACE/pse-test-media",
                     license="BSD-3-Clause",
@@ -248,6 +276,11 @@ def trace_rows() -> Iterable[Row]:
                     path=str(gen_path.relative_to(CORPUS_DIR.parent)),
                     expected_label=label,
                     expected_detail_file=str(gt_csv.relative_to(CORPUS_DIR.parent)),
+                    expected_trace24=per_std.get("trace24", ""),
+                    expected_wcag2_2=per_std.get("wcag2_2", ""),
+                    expected_ofcom2017=per_std.get("ofcom2017", ""),
+                    expected_itu_r1702_4=per_std.get("itu_r1702_4", ""),
+                    expected_iso9241_391=per_std.get("iso", ""),
                     standard_clause=clause,
                     frame_rate=str(fps),
                     color_space=color,
@@ -261,6 +294,30 @@ def trace_rows() -> Iterable[Row]:
                         f"upstream_limiting_dimension={limiting_dim}"
                     ),
                 )
+
+
+def _read_expected_result(json_path: Path) -> dict[str, str]:
+    """Read a TRACE per-fixture JSON's expected_result block and normalize
+    each verdict to "PASS" / "FAIL". Missing keys yield "" (not applicable
+    / not asserted for that standard)."""
+    if not json_path.exists():
+        return {}
+    try:
+        d = json.loads(json_path.read_text())
+    except Exception:
+        return {}
+    raw = d.get("expected_result", {})
+    out: dict[str, str] = {}
+    for k, v in raw.items():
+        if not isinstance(v, str):
+            continue
+        norm = v.strip().lower()
+        if norm == "pass":
+            out[k] = "PASS"
+        elif norm == "fail":
+            out[k] = "FAIL"
+        # other values silently ignored; missing == not applicable
+    return out
 
 
 def iris_video_rows() -> Iterable[Row]:

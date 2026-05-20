@@ -27,11 +27,17 @@ from harness.schema import NormalizedResult
 TOOL = "iris"
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-# Conventional build output location (matches Dockerfile build step).
+# The example app is built as the `IrisApp` cmake target. With the
+# `linux-release` preset the binary lands at
+# bin/build/linux-release/example/IrisApp inside the IRIS source tree.
+# The Dockerfile additionally installs it to /usr/local/bin/iris-example
+# for runtime invocation by this adapter.
 IRIS_BINARY_CANDIDATES = [
-    REPO_ROOT / "corpus" / "sources" / "IRIS" / "build" / "linux-release"  / "example" / "Iris.Example",
-    REPO_ROOT / "corpus" / "sources" / "IRIS" / "build" / "release"        / "example" / "Iris.Example",
-    REPO_ROOT / "corpus" / "sources" / "IRIS" / "out"   / "build" / "linux-release" / "example" / "Iris.Example",
+    Path("/usr/local/bin/iris-example"),
+    REPO_ROOT / "corpus" / "sources" / "IRIS" / "bin" / "build" / "linux-release"  / "example" / "IrisApp",
+    REPO_ROOT / "corpus" / "sources" / "IRIS" / "bin" / "build" / "linux-debug"    / "example" / "IrisApp",
+    REPO_ROOT / "corpus" / "sources" / "IRIS" / "bin" / "build" / "macos-release"  / "example" / "IrisApp",
+    REPO_ROOT / "corpus" / "sources" / "IRIS" / "bin" / "build" / "windows-release" / "example" / "IrisApp.exe",
 ]
 
 
