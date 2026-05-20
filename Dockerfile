@@ -33,16 +33,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl wget git make \
         ffmpeg \
         build-essential gcc g++ cmake ninja-build clang lld pkg-config \
-        zip unzip tar autoconf automake libtool \
+        zip unzip tar autoconf automake libtool libtool-bin \
+        autoconf-archive gettext intltool gtk-doc-tools dh-autoreconf \
+        bison flex m4 gperf texinfo nasm \
+        # X11 dev libs needed for cairo (vcpkg pulls cairo with x11 feature
+        # via opencv-contrib -> highgui chain).
+        libx11-dev libxext-dev libxrender-dev libxft-dev \
+        libxcb1-dev libxrandr-dev libxinerama-dev libxi-dev libxv-dev \
+        libxcursor-dev libxfixes-dev libxdamage-dev libxcomposite-dev \
+        # OpenGL/EGL for opencv GUI modules.
+        libgl1-mesa-dev libegl1-mesa-dev libgles2-mesa-dev \
+        # Other commonly required headers.
+        libgtk-3-dev libssl-dev \
         python3 python3-pip python3-venv \
         octave \
         jq \
     && rm -rf /var/lib/apt/lists/*
 
-# vcpkg -- shallow clone at a recent commit; IRIS's vcpkg.json pins its
-# baseline so the package versions are reproducible regardless of vcpkg
-# HEAD.
-RUN git clone --depth 1 https://github.com/microsoft/vcpkg.git ${VCPKG_ROOT} \
+# vcpkg -- full clone (not shallow). IRIS's vcpkg.json pins
+# `builtin-baseline` to an older upstream commit; a `--depth 1` clone
+# would not contain that commit's history and `vcpkg install` would
+# fail with "path 'versions/baseline.json' exists on disk, but not in
+# <baseline-commit>". The full clone is ~150 MB and is reproducible
+# enough -- the baseline commit pins package versions; we just need the
+# history to reach that commit.
+RUN git clone https://github.com/microsoft/vcpkg.git ${VCPKG_ROOT} \
  && ${VCPKG_ROOT}/bootstrap-vcpkg.sh -disableMetrics
 
 # IRIS at the pinned commit. Build with BUILD_EXAMPLE_APP=ON since the
@@ -53,6 +68,7 @@ RUN git clone https://github.com/electronicarts/IRIS.git /opt/IRIS \
  && git checkout ${IRIS_COMMIT} \
  && cmake --preset linux-release \
       -DBUILD_EXAMPLE_APP=ON \
+      -DCMAKE_MAKE_PROGRAM=/usr/bin/ninja \
  && cmake --build --preset linux-release --target IrisApp \
  && install -m 0755 /opt/IRIS/bin/build/linux-release/example/IrisApp \
       /usr/local/bin/iris-example
