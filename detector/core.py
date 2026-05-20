@@ -1,55 +1,62 @@
-"""detector/core.py -- JAX-accelerated PSE detector.
+"""detector/core.py -- PyTorch-accelerated PSE detector.
 
-Per-frame compute runs as ``jax.jit``-compiled tensor ops on whatever
-backend JAX has selected (Metal on Apple Silicon, CUDA on NVIDIA, CPU
-elsewhere). cv2 is still used for frame I/O and for the rare
-connected-components call on the hazard mask (no JAX equivalent; the
-call is gated by an early-exit on the cheap ``max()`` over windowed
-counts).
+PyTorch port of the classical algorithm, structured to allow direct
+comparison against the JAX version on `main`. The algorithm is
+identical (region-mean ΔL via CC on cv2/numpy, anchor-based darker
+bound, no-reset-on-fail, incremental sliding window); only the tensor
+framework changes.
 
-Algorithm unchanged from the classical version (THRESHOLDS.md). The
-shape of the implementation is:
+Backend selection: MPS on Apple Silicon (M-series), CUDA on NVIDIA, CPU
+elsewhere. PyTorch's MPS backend is materially more mature than
+jax-metal (the JAX Apple-GPU backend currently fails at module import
+on the M4 Max), which is the main reason this branch exists -- to find
+out whether we can get useful GPU acceleration that JAX couldn't give
+us today.
 
-  - One ``jit``-compiled function fuses the entire per-frame compute
-    into a single kernel: sRGB → relative luminance, saturated red,
-    region-mean ΔL (via local-mean convolution), per-axis accumulator
-    + anchor gate, sliding-window count update.
-  - Region-mean ΔL is approximated as a windowed average rather than
-    computed via connected components. For large uniform flash regions
-    (which is what TRACE / production content looks like) the two are
-    functionally equivalent; the convolution form is jit-friendly and
-    much faster than a boundary-crossing CC call per frame.
-  - Sliding window is a list of ``window_frames`` jnp arrays plus a
-    write-index pointer; the running count is maintained by jit as a
-    pure functional update.
-
-This file kept the same public API (``analyze``, ``Result``, ``PerFrame``,
-``Profile``, ``PROFILES``, ``detect_static_pattern_hazard``); harness
-adapters don't need to change.
+Pipeline shape (same as JAX version):
+  numpy uint8 frame
+    -> torch.from_numpy + .to(DEVICE)
+    -> srgb_to_relative_luminance via 256-entry LUT
+    -> saturated_red
+    -> [numpy] regional_delta via cv2 connected components
+    -> axis_step (accumulator + anchor gate + reset)
+    -> incremental window count update
+    -> [numpy/cv2] hazard CC -- only when the cheap max-check fires
 """
 
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import NamedTuple, Optional
+from typing import Optional
 
 import cv2  # type: ignore
-import jax
-import jax.numpy as jnp
 import numpy as np
+import torch
 
 
-# Suppress JAX's metal-backend chatter on import.
-import os as _os
-_os.environ.setdefault("JAX_PLATFORM_NAME", _os.environ.get("JAX_PLATFORM_NAME", ""))
+# --- Device selection ------------------------------------------------------
+
+def _select_device() -> torch.device:
+    """Pick the best device available. Respect TORCH_DEVICE env var override
+    for benchmarking ('cpu', 'mps', 'cuda')."""
+    forced = os.environ.get("TORCH_DEVICE", "").lower()
+    if forced in ("cpu", "mps", "cuda"):
+        return torch.device(forced)
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+DEVICE = _select_device()
 
 
 # --- Constants (sourced from detector/THRESHOLDS.md) -----------------------
 
-# sRGB → linear LUT. 256 entries (input is discrete uint8), so this is
-# exact, not an approximation. Stored as a jnp array for jit'd lookup.
 def _build_srgb_lin_lut() -> np.ndarray:
     lut = np.empty(256, dtype=np.float32)
     for i in range(256):
@@ -57,7 +64,7 @@ def _build_srgb_lin_lut() -> np.ndarray:
         lut[i] = v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
     return lut
 _SRGB_LIN_LUT_NP = _build_srgb_lin_lut()
-_SRGB_LIN_LUT = jnp.asarray(_SRGB_LIN_LUT_NP)
+_SRGB_LIN_LUT = torch.from_numpy(_SRGB_LIN_LUT_NP).to(DEVICE)
 
 
 @dataclass(frozen=True)
@@ -67,7 +74,7 @@ class Profile:
     general_flash_luminance_delta: float = 0.1
     general_flash_darker_bound: float = 0.8
     area_fraction_limit: float = 0.25
-    area_pixels_limit: int = 10_000_000  # effectively disabled by default
+    area_pixels_limit: int = 10_000_000
     red_flash_max_per_second: int = 3
     red_sat_delta: int = 20
     red_sat_min: int = 80
@@ -141,50 +148,57 @@ class Result:
     n_frames: int = 0
 
 
-# --- JAX state types (immutable; jit-friendly) -----------------------------
+# --- Per-axis state (mutable; torch supports in-place ops) ----------------
 
-class AxisState(NamedTuple):
-    acc: jnp.ndarray            # HxW float32, signed accumulator
-    anchor: jnp.ndarray         # HxW float32, signal value at last fire
-    window_counts: jnp.ndarray  # HxW int16, running sum of fires in window
+class AxisState:
+    __slots__ = ("acc", "anchor", "window_counts")
+
+    def __init__(self, h: int, w: int):
+        self.acc = torch.zeros((h, w), dtype=torch.float32, device=DEVICE)
+        self.anchor = torch.zeros((h, w), dtype=torch.float32, device=DEVICE)
+        self.window_counts = torch.zeros((h, w), dtype=torch.int16, device=DEVICE)
 
 
-# --- Pixel-feature kernels (jit'd) -----------------------------------------
+# --- Pixel-feature kernels -------------------------------------------------
 
-@jax.jit
-def _srgb_to_relative_luminance(bgr_uint8: jnp.ndarray) -> jnp.ndarray:
-    """L in [0,1] from BGR uint8 image, using the precomputed LUT."""
-    b_lin = _SRGB_LIN_LUT[bgr_uint8[..., 0]]
-    g_lin = _SRGB_LIN_LUT[bgr_uint8[..., 1]]
-    r_lin = _SRGB_LIN_LUT[bgr_uint8[..., 2]]
+# Whether to use torch.compile (PyTorch 2.x TorchInductor). Compile cost
+# is paid once per shape/profile pair; benefits the steady-state loop.
+# Set TORCH_COMPILE=0 in env to disable for benchmarking.
+_USE_COMPILE = os.environ.get("TORCH_COMPILE", "1") != "0"
+
+
+def _srgb_to_relative_luminance_impl(bgr_uint8: torch.Tensor) -> torch.Tensor:
+    """L in [0,1] from BGR uint8 tensor, via 256-entry LUT."""
+    b_lin = _SRGB_LIN_LUT[bgr_uint8[..., 0].long()]
+    g_lin = _SRGB_LIN_LUT[bgr_uint8[..., 1].long()]
+    r_lin = _SRGB_LIN_LUT[bgr_uint8[..., 2].long()]
     return 0.2126 * r_lin + 0.7152 * g_lin + 0.0722 * b_lin
 
 
-@jax.jit
-def _saturated_red(bgr_uint8: jnp.ndarray) -> jnp.ndarray:
+def _saturated_red_impl(bgr_uint8: torch.Tensor) -> torch.Tensor:
     """R - max(G, B), clamped to [0, 255], as float32."""
-    b = bgr_uint8[..., 0].astype(jnp.int16)
-    g = bgr_uint8[..., 1].astype(jnp.int16)
-    r = bgr_uint8[..., 2].astype(jnp.int16)
-    return jnp.clip(r - jnp.maximum(g, b), 0, 255).astype(jnp.float32)
+    b = bgr_uint8[..., 0].to(torch.int16)
+    g = bgr_uint8[..., 1].to(torch.int16)
+    r = bgr_uint8[..., 2].to(torch.int16)
+    return torch.clamp(r - torch.maximum(g, b), 0, 255).to(torch.float32)
 
 
-# --- Region-mean ΔL (local-mean approximation, jit'd) ----------------------
+_srgb_to_relative_luminance = (
+    torch.compile(_srgb_to_relative_luminance_impl, mode="reduce-overhead")
+    if _USE_COMPILE else _srgb_to_relative_luminance_impl
+)
+_saturated_red = (
+    torch.compile(_saturated_red_impl, mode="reduce-overhead")
+    if _USE_COMPILE else _saturated_red_impl
+)
+
+
+# --- Region-mean ΔL (numpy/cv2; no torch equivalent) ----------------------
 
 def _regional_delta(delta_np: np.ndarray,
                     intensity_threshold: float) -> np.ndarray:
-    """CC-based region-mean ΔL (numpy/cv2). For each connected component
-    of "active" pixels (|delta| > threshold/4) with area >= 100, replace
-    each pixel's ΔL with the component's mean ΔL. Inactive pixels keep
-    their original (small) delta.
-
-    Stays on the numpy side because cv2.connectedComponentsWithStats has
-    no jnp equivalent. One numpy↔jnp boundary crossing per frame; cheap
-    relative to the per-frame JAX compute that follows. An early version
-    tried a pure-JAX local-mean approximation via separable box blur,
-    but it under-counted on TRACE's wcagc fixtures (kernel-window mean
-    differs from true-region mean near boundaries); CC is exact.
-    """
+    """CC-based region-mean ΔL. Same algorithm as the JAX branch's helper
+    by the same name; this is independent code (no torch dependency)."""
     active = np.abs(delta_np) > intensity_threshold * 0.25
     if not active.any():
         return delta_np
@@ -202,56 +216,71 @@ def _regional_delta(delta_np: np.ndarray,
     return out
 
 
-# --- Per-axis step (jit'd) -------------------------------------------------
+# --- Per-axis step ---------------------------------------------------------
 
-@jax.jit
-def _axis_step_lum(state: AxisState, signal: jnp.ndarray,
-                    delta: jnp.ndarray,
-                    threshold: float, darker_bound: float):
-    """One frame of per-axis work for luminance: accumulator update +
-    reset, anchor advance, return (new_state, fired_mask). ``delta`` is
-    the pre-computed (region-mean) ΔL vs the previous frame."""
-    new_acc = state.acc + delta
+def _axis_step_lum_impl(acc: torch.Tensor, anchor: torch.Tensor,
+                         signal: torch.Tensor, delta: torch.Tensor,
+                         threshold: float, darker_bound: float):
+    """Pure functional axis step (returns new acc, new anchor, fired).
+    Pure-function form so torch.compile can JIT the entire step."""
+    new_acc = acc + delta
     crossed = (new_acc >= threshold) | (new_acc <= -threshold)
-    # Darker-bound gate: min(L_current, L_anchor) < darker_bound. When
-    # darker_bound >= 1.0 (effectively disabled) the gate passes everything.
-    gate_ok = jnp.minimum(signal, state.anchor) < darker_bound
+    gate_ok = torch.minimum(signal, anchor) < darker_bound
     fired = crossed & gate_ok
-    new_acc = jnp.where(fired, 0.0, new_acc)
-    new_anchor = jnp.where(fired, signal, state.anchor)
-    return AxisState(new_acc, new_anchor, state.window_counts), fired
+    zero = torch.zeros_like(new_acc)
+    new_acc = torch.where(fired, zero, new_acc)
+    new_anchor = torch.where(fired, signal, anchor)
+    return new_acc, new_anchor, fired
 
 
-@jax.jit
-def _axis_step_red(state: AxisState, signal: jnp.ndarray,
-                    delta: jnp.ndarray,
-                    threshold: float, sat_min: float):
-    """Red axis: same shape; the gate is the saturated-red minimum (the
-    LARGER of the two endpoints must clear sat_min)."""
-    new_acc = state.acc + delta
+def _axis_step_red_impl(acc: torch.Tensor, anchor: torch.Tensor,
+                         signal: torch.Tensor, delta: torch.Tensor,
+                         threshold: float, sat_min: float):
+    new_acc = acc + delta
     crossed = (new_acc >= threshold) | (new_acc <= -threshold)
-    gate_ok = jnp.maximum(signal, state.anchor) >= sat_min
+    gate_ok = torch.maximum(signal, anchor) >= sat_min
     fired = crossed & gate_ok
-    new_acc = jnp.where(fired, 0.0, new_acc)
-    new_anchor = jnp.where(fired, signal, state.anchor)
-    return AxisState(new_acc, new_anchor, state.window_counts), fired
+    zero = torch.zeros_like(new_acc)
+    new_acc = torch.where(fired, zero, new_acc)
+    new_anchor = torch.where(fired, signal, anchor)
+    return new_acc, new_anchor, fired
 
 
-@jax.jit
-def _window_update(window_counts: jnp.ndarray, new_fired: jnp.ndarray,
-                   evicted: jnp.ndarray) -> jnp.ndarray:
-    """Incremental update: add new fires, subtract evicted fires."""
-    return window_counts + new_fired.astype(jnp.int16) - evicted.astype(jnp.int16)
+_axis_step_lum_compiled = (
+    torch.compile(_axis_step_lum_impl, mode="reduce-overhead")
+    if _USE_COMPILE else _axis_step_lum_impl
+)
+_axis_step_red_compiled = (
+    torch.compile(_axis_step_red_impl, mode="reduce-overhead")
+    if _USE_COMPILE else _axis_step_red_impl
+)
+
+
+def _axis_step_lum(state: AxisState, signal: torch.Tensor,
+                   delta: torch.Tensor,
+                   threshold: float, darker_bound: float) -> torch.Tensor:
+    """Wraps the compiled pure-function form; writes back into state."""
+    new_acc, new_anchor, fired = _axis_step_lum_compiled(
+        state.acc, state.anchor, signal, delta, threshold, darker_bound)
+    state.acc = new_acc
+    state.anchor = new_anchor
+    return fired
+
+
+def _axis_step_red(state: AxisState, signal: torch.Tensor,
+                   delta: torch.Tensor,
+                   threshold: float, sat_min: float) -> torch.Tensor:
+    new_acc, new_anchor, fired = _axis_step_red_compiled(
+        state.acc, state.anchor, signal, delta, threshold, sat_min)
+    state.acc = new_acc
+    state.anchor = new_anchor
+    return fired
 
 
 # --- Region-aware area decision (numpy/cv2 boundary; called rarely) --------
 
 def _region_exceeds_area(hazard_mask_np: np.ndarray, n_pixels: int,
                          fraction_limit: float, pixels_limit: int) -> bool:
-    """True iff any connected component of ``hazard_mask`` exceeds either
-    the screen-fraction limit or the absolute pixel-area limit. Numpy-side
-    (cv2 has no jnp equivalent); called only when the cheap max-check
-    early-exit fails."""
     if not hazard_mask_np.any():
         return False
     n_labels, _labels, stats, _ = cv2.connectedComponentsWithStats(
@@ -268,7 +297,6 @@ def _region_exceeds_area(hazard_mask_np: np.ndarray, n_pixels: int,
 def detect_static_pattern_hazard(image_path: Path,
                                   profile: str = "ITU-R-BT.1702"
                                   ) -> tuple[bool, dict]:
-    """Return (is_hazardous, info) for a still image under ``profile``."""
     p = PROFILES[profile]
     if not p.pattern_hazard_enabled:
         return False, {"reason": "pattern_hazard disabled in profile",
@@ -322,14 +350,6 @@ def detect_static_pattern_hazard(image_path: Path,
 
 # --- Main analyzer ---------------------------------------------------------
 
-def _initial_axis_state(h: int, w: int) -> AxisState:
-    return AxisState(
-        acc=jnp.zeros((h, w), dtype=jnp.float32),
-        anchor=jnp.zeros((h, w), dtype=jnp.float32),
-        window_counts=jnp.zeros((h, w), dtype=jnp.int16),
-    )
-
-
 def analyze(video_path: Path, profile: str = "WCAG2.2-SC2.3.1") -> Result:
     if profile not in PROFILES:
         raise ValueError(f"unknown profile {profile!r}; known: {sorted(PROFILES)}")
@@ -348,8 +368,6 @@ def analyze(video_path: Path, profile: str = "WCAG2.2-SC2.3.1") -> Result:
     n_pixels = max(1, width * height)
     window_frames = max(1, int(round(p.sliding_window_seconds * fps)))
 
-    # Profile-derived static thresholds (closed over by jit; the jit cache
-    # is keyed on these as Python floats, so each profile compiles once).
     lum_threshold = float(p.general_flash_luminance_delta)
     lum_darker_bound = float(p.general_flash_darker_bound)
     red_threshold = float(p.red_sat_delta)
@@ -359,18 +377,15 @@ def analyze(video_path: Path, profile: str = "WCAG2.2-SC2.3.1") -> Result:
     abs_cap = (2 * p.absolute_flashes_per_second_cap
                if p.absolute_flashes_per_second_cap is not None else None)
 
-    # Per-axis state, plus circular buffer of fired masks for window
-    # eviction. Buffers are Python lists of jnp arrays; the running
-    # `window_counts` inside each AxisState is the maintained sum.
-    lum_state = _initial_axis_state(height, width)
-    red_state = _initial_axis_state(height, width)
-    zero_fired = jnp.zeros((height, width), dtype=jnp.bool_)
-    lum_window = [zero_fired] * window_frames
-    red_window = [zero_fired] * window_frames
+    lum_state = AxisState(height, width)
+    red_state = AxisState(height, width)
+    zero_fired = torch.zeros((height, width), dtype=torch.bool, device=DEVICE)
+    lum_window = [zero_fired.clone() for _ in range(window_frames)]
+    red_window = [zero_fired.clone() for _ in range(window_frames)]
     write_idx = 0
 
-    prev_L: Optional[jnp.ndarray] = None
-    prev_R: Optional[jnp.ndarray] = None
+    prev_L: Optional[torch.Tensor] = None
+    prev_R: Optional[torch.Tensor] = None
     per_frame: list[PerFrame] = []
     failed_dims: set[str] = set()
     first_fail_ts: Optional[float] = None
@@ -383,58 +398,55 @@ def analyze(video_path: Path, profile: str = "WCAG2.2-SC2.3.1") -> Result:
         frame_idx += 1
         timestamp = (frame_idx - 1) / fps
 
-        frame_j = jnp.asarray(frame)  # numpy uint8 → jax (zero-copy on CPU)
-        L = _srgb_to_relative_luminance(frame_j)
-        R = _saturated_red(frame_j)
+        frame_t = torch.from_numpy(frame).to(DEVICE)  # uint8 HxWx3
+        L = _srgb_to_relative_luminance(frame_t)
+        R = _saturated_red(frame_t)
 
         if prev_L is None:
             prev_L, prev_R = L, R
-            lum_state = lum_state._replace(anchor=L)
-            red_state = red_state._replace(anchor=R)
+            lum_state.anchor = L.clone()
+            red_state.anchor = R.clone()
             per_frame.append(PerFrame(frame=frame_idx, timestamp=timestamp,
                                        lum_transitions=0, red_transitions=0,
                                        flash_area=0.0))
             continue
 
-        # Region-mean ΔL on numpy/cv2 side. One boundary crossing per
-        # frame; cheap relative to the per-frame JAX compute.
-        lum_delta = jnp.asarray(_regional_delta(
-            np.asarray(L - prev_L), lum_threshold))
-        red_delta = jnp.asarray(_regional_delta(
-            np.asarray(R - prev_R), red_threshold))
+        # Region-mean ΔL on numpy/cv2 side. One boundary crossing per frame.
+        # .cpu().numpy() is needed for MPS/CUDA tensors; on CPU it's a no-op.
+        lum_delta_np = _regional_delta(
+            (L - prev_L).cpu().numpy(), lum_threshold)
+        red_delta_np = _regional_delta(
+            (R - prev_R).cpu().numpy(), red_threshold)
+        lum_delta = torch.from_numpy(lum_delta_np).to(DEVICE)
+        red_delta = torch.from_numpy(red_delta_np).to(DEVICE)
 
-        # Per-axis update (fully jit'd).
-        lum_state, lum_fired = _axis_step_lum(
+        # Per-axis update (mutates state).
+        lum_fired = _axis_step_lum(
             lum_state, L, lum_delta, lum_threshold, lum_darker_bound)
-        red_state, red_fired = _axis_step_red(
+        red_fired = _axis_step_red(
             red_state, R, red_delta, red_threshold, red_sat_min)
 
-        # Incremental window update (jit'd). Evict the mask in the
-        # current write slot (which is the oldest entry once the window
-        # is full; before that it's an all-zero placeholder).
-        new_lum_counts = _window_update(
-            lum_state.window_counts, lum_fired, lum_window[write_idx])
-        new_red_counts = _window_update(
-            red_state.window_counts, red_fired, red_window[write_idx])
-        lum_state = lum_state._replace(window_counts=new_lum_counts)
-        red_state = red_state._replace(window_counts=new_red_counts)
+        # Incremental window update.
+        lum_state.window_counts += lum_fired.to(torch.int16)
+        lum_state.window_counts -= lum_window[write_idx].to(torch.int16)
+        red_state.window_counts += red_fired.to(torch.int16)
+        red_state.window_counts -= red_window[write_idx].to(torch.int16)
         lum_window[write_idx] = lum_fired
         red_window[write_idx] = red_fired
         write_idx = (write_idx + 1) % window_frames
 
-        # Early-exit hazard test. Max-check is cheap; CC only if it could
-        # possibly trigger.
-        lum_max = int(new_lum_counts.max())
-        red_max = int(new_red_counts.max())
+        # Hazard tests.
+        lum_max = int(lum_state.window_counts.max().item())
+        red_max = int(red_state.window_counts.max().item())
 
         if "luminance" not in failed_dims and lum_max > lum_count_thresh:
-            mask_np = np.asarray(new_lum_counts > lum_count_thresh)
+            mask_np = (lum_state.window_counts > lum_count_thresh).cpu().numpy()
             if _region_exceeds_area(mask_np, n_pixels,
                                      p.area_fraction_limit, p.area_pixels_limit):
                 failed_dims.add("luminance")
                 if first_fail_ts is None: first_fail_ts = timestamp
         if "red" not in failed_dims and red_max > red_count_thresh:
-            mask_np = np.asarray(new_red_counts > red_count_thresh)
+            mask_np = (red_state.window_counts > red_count_thresh).cpu().numpy()
             if _region_exceeds_area(mask_np, n_pixels,
                                      p.area_fraction_limit, p.area_pixels_limit):
                 failed_dims.add("red")
@@ -448,7 +460,8 @@ def analyze(video_path: Path, profile: str = "WCAG2.2-SC2.3.1") -> Result:
             frame=frame_idx, timestamp=timestamp,
             lum_transitions=lum_max,
             red_transitions=red_max,
-            flash_area=float(max(lum_fired.sum(), red_fired.sum())) / n_pixels,
+            flash_area=float(max(lum_fired.sum().item(),
+                                  red_fired.sum().item())) / n_pixels,
         ))
         prev_L, prev_R = L, R
 
@@ -492,7 +505,7 @@ def _main_cli(argv: list[str]) -> int:
         "first_fail_timestamp": res.first_fail_timestamp,
         "fps":                  res.fps,
         "n_frames":             res.n_frames,
-        "backend":              str(jax.default_backend()),
+        "backend":              str(DEVICE),
     }, indent=2))
 
     if args.per_frame_csv:
@@ -509,7 +522,6 @@ def _main_cli(argv: list[str]) -> int:
 
 
 def _self_test() -> int:
-    """Smoke test on two synthetic clips labelled analytically."""
     import tempfile, shutil
     tmp = Path(tempfile.mkdtemp(prefix="detector_selftest_"))
     try:
@@ -526,7 +538,7 @@ def _self_test() -> int:
             writer.release()
         r_pass = analyze(passing)
         r_fail = analyze(failing)
-        print(f"self-test (jax backend={jax.default_backend()}): "
+        print(f"self-test (torch device={DEVICE}): "
               f"2Hz -> {r_pass.verdict} (expect PASS); "
               f"5Hz -> {r_fail.verdict} (expect FAIL); dims={r_fail.failed_dimensions}")
         return 0 if (r_pass.verdict == "PASS" and r_fail.verdict == "FAIL") else 1
