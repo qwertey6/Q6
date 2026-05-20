@@ -6,3 +6,12 @@ Pillow==10.4.0
 imageio==2.34.2
 imageio-ffmpeg==0.5.1
 jsonschema==4.23.0
+
+# JAX is used by the detector for jit-compiled per-frame compute. CPU
+# backend is the working one today; jax-metal is experimental and was
+# observed to fail at module import on Apple M4 Max -- if you want to
+# try GPU acceleration on a supported NVIDIA system, install jax[cuda]
+# or jax[cuda12-pip] separately. Pin both jax and jaxlib together --
+# they're tightly coupled.
+jax==0.10.1
+jaxlib==0.10.1
