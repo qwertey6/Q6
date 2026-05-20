@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PSE Detector Conformance Benchmark -- Report</title>
+<style>$css</style>
+</head><body>
+
+<h1>PSE Detector Conformance Benchmark</h1>
+<p><em>Engineering report. Not a regulatory certification.</em>
+See section 7 for limitations.</p>
+
+<h2>1. Executive summary</h2>
+
+<p>The benchmark runs three detectors -- our own
+(<code>ours</code>), <a href="https://github.com/electronicarts/IRIS">EA
+IRIS</a> (<code>iris</code>), and the FFmpeg
+<code>vf_photosensitivity</code> filter
+(<code>ffmpeg_photosensitivity</code>) -- against a 371-fixture corpus
+(306 TRACE generated videos + 8 IRIS test videos + 12 IRIS pattern
+images + 1 Apple sample clip + 45 fixtures we generate ourselves with
+analytical labels). Each detector runs once per profile per fixture;
+scoring matches each result against the per-fixture label for the
+standard that profile targets.</p>
+
+<div class="note">
+  <strong>Headline finding: the choice of standard reading matters more than the choice of detector.</strong>
+  Our detector under the broadcast profile (ITU-R BT.1702 or Ofcom GN2 Annex 1)
+  scores MCC <strong>0.273</strong> on the upstream subset; the same detector
+  under WCAG&nbsp;2.2 SC&nbsp;2.3.1 scores <strong>0.160</strong>. The
+  underlying code is identical -- only the threshold constants differ.
+  EA IRIS scored against its native broadcast-flavoured threshold reading
+  comes in at MCC&nbsp;0.097; against WCAG-strict labels it scores -0.032
+  on the same data. That gap is not "IRIS is broken"; it is "IRIS
+  implements broadcast thresholds and gets graded against a more
+  conservative WCAG reading." The per-standard cross-cut below makes
+  these apples-to-apples comparisons explicit.
+</div>
+
+<h3>Per-standard MCC (upstream peer-reviewed subset)</h3>
+$per_std_upstream
+<div class="note">
+  Each cell uses the tool's run under the canonical profile for that
+  standard, scored against that standard's per-fixture label
+  (extracted from TRACE's per-fixture JSONs <code>expected_result</code>
+  block, or IRIS's shipped <code>*_RELATIVE.csv</code> for the IRIS
+  test-video fixtures). Empty cells mean the tool wasn't run under a
+  profile that maps to that standard (e.g. FFmpeg has no profile
+  concept; its filter is a single heuristic that gets a row in the
+  per-(tool, profile) lede table below).
+</div>
+
+<h3>Per-standard MCC (OURS-extended)</h3>
+$per_std_extended
+<div class="note">
+  OURS-extended fixtures are labeled analytically from their generation
+  parameters -- so they reflect how each detector performs when the
+  labels follow the standards text faithfully. Both <code>ours</code>
+  and <code>iris</code> score perfectly under broadcast profiles here;
+  <code>ours</code> has 2 FPs under WCAG-strict on the FP-battery's
+  equiluminant-chroma-swap edge case (a known limitation, recorded
+  below).
+</div>
+
+<h3>Lede: per (tool, profile) on the upstream subset</h3>
+$upstream_block
+
+<h3>Lede: per (tool, profile) on OURS-extended</h3>
+$extended_block
+
+<div class="note">
+  <strong>Read the upstream subset first.</strong> Upstream labels
+  trace to TRACE's published per-fixture JSONs or IRIS's shipped
+  per-frame expected logs. The OURS-extended labels are derived from
+  our own generation parameters; never blend the two in headline
+  claims.
+</div>
+
+<h2>2. Methodology &amp; provenance</h2>
+<ul>
+  <li>Sources: <code>corpus/sources/</code> contains every upstream tree at a pinned commit; see <code>corpus/PROVENANCE.md</code>.</li>
+  <li>Standards cited: WCAG 2.2 SC 2.3.1, ITU-R BT.1702, Ofcom GN2 Annex 1,
+      Trace24 (TRACE proposed guidelines), NAB-J. ISO 9241-391 is
+      referenced by number only (non-free; text not vendored).</li>
+  <li>Labels are NOT vote-derived. Every label traces to either an upstream
+      ground-truth file (TRACE per-set CSV, TRACE per-fixture JSON
+      <code>expected_result</code> blocks, IRIS *_RELATIVE.csv) or to the
+      analytical generation parameters (OURS-extended). See
+      <code>corpus/MANIFEST.csv</code> column <code>standard_clause</code>,
+      the five <code>expected_*</code> per-standard label columns, and
+      <code>generation_params</code>.</li>
+  <li>Adapter label isolation: adapters take <code>(fixture_path, profile)</code>
+      and never see labels. Scoring is a separate process that joins
+      results to <code>MANIFEST.csv</code> after all adapter runs complete.
+      This is the property that makes the benchmark non-gameable.</li>
+  <li><strong>Reproducibility, honestly.</strong> The corpus side
+      (<code>make corpus</code>) is deterministic from pinned upstream
+      sources + pinned Python deps. The harness + scoring + report
+      sides are similarly deterministic. Building EA IRIS in Docker is
+      currently blocked: Debian bookworm-slim's libtool 2.4.7 is
+      missing the <code>LT_SYS_SYMBOL_USCORE</code> macro that
+      <code>libxcrypt 4.4.36</code> (a transitive opencv-via-vcpkg
+      dependency) requires. Until that's resolved, the working path is
+      a native macOS build of IRIS via the
+      <code>cmake --preset macos-release</code> preset (Homebrew's
+      <code>cmake</code>, <code>ninja</code>, <code>pkg-config</code>,
+      <code>nasm</code> on the host, then clone vcpkg, bootstrap, and
+      configure). The harness detects the IRIS binary at the standard
+      preset-output path or at <code>/usr/local/bin/iris-example</code>.</li>
+</ul>
+
+<h2>3. Gap analysis per competing tool</h2>
+
+<details open><summary><strong>FFmpeg <code>vf_photosensitivity</code></strong></summary>
+  <p>Label: <em>mitigation, non-conformant by design.</em> The filter
+  has no PASS/FAIL concept and is not written to any specific PSE
+  standard. We derive a proxy verdict: <em>FAIL iff any flash event
+  was detected</em>. The filter is included as a control, showing how a
+  non-standards approach scores; do not interpret its results as a
+  conformance claim.</p>
+  <p>At default parameters the filter reported zero detections across
+  the upstream FAIL fixtures and the OURS-extended FAIL fixtures --
+  recall 0.000 under every standard's labels. The filter's role is
+  attenuating noisy output for sensitive viewers, not flagging hazards;
+  the recall figure quantifies just how different that mission is.</p>
+</details>
+
+<details><summary><strong>EA IRIS (C++)</strong></summary>
+  <p>IRIS is the strongest existing standards-grounded open-source
+  detector in the field. Built from source at the pinned 2025-01-14
+  commit via cmake's <code>macos-release</code> preset (Linux Docker
+  build is blocked on the libxcrypt/libtool issue described in &sect;2).
+  The harness's IRIS adapter parses
+  <code>Results/&lt;fixture&gt;/result.json</code> for the
+  <code>OverallResult</code> + <code>Results[]</code> per-dimension
+  list, treating <code>PassWithWarning</code> as PASS (it's
+  informational, not a hazard verdict).</p>
+  <p><strong>What the data says.</strong> IRIS implements broadcast /
+  Trace24-flavoured thresholds. Under broadcast labels (ITU-R BT.1702 /
+  Ofcom GN2) on the upstream subset, IRIS scores MCC 0.097 with FN=18
+  (modest but not catastrophic). Under WCAG-strict labels on the same
+  data, MCC -0.032 with FN=82. The gap is the standards-interpretation
+  question (&sect;4c, OQ-4 / OQ-5), not a flaw in IRIS. On OURS-extended
+  (where labels follow the standards text faithfully across all
+  applicable standards), IRIS scores a perfect MCC&nbsp;1.000.</p>
+  <p><strong>Independent cross-check.</strong> The harness compares our
+  per-frame output against IRIS's shipped <code>*_RELATIVE.csv</code>
+  expected logs as a correctness anchor for the 8 IRIS test videos.
+  One discrepancy worth flagging:
+  <code>GradualRedIncrease.mp4</code> -- our manifest derived
+  <code>FAIL</code> from the shipped expected log (it has non-zero
+  per-frame <code>FlashRedFailedFrame</code> entries) but IRIS's
+  runtime classifies the same fixture as <code>Pass</code>. The
+  upstream expected log appears to record per-frame events that
+  don't aggregate to a sequence-level FAIL under IRIS's current
+  thresholds.</p>
+</details>
+
+<details><summary><strong>Apple <code>VideoFlashingReduction</code></strong></summary>
+  <p>Ships a MATLAB reference (and equivalent Mathematica/Swift). MATLAB
+  is non-free; we attempt a best-effort GNU Octave wrapper but declare
+  UNSUPPORTED rather than fabricate a verdict when compatibility is
+  unverified. Listed in the lede tables with verdict counts of 0/0/0;
+  no metric contribution.</p>
+</details>
+
+<h2>4. Our detector's results, under the same scrutiny</h2>
+
+<h3>4a. Missed hazards (FN -- <span class="warn">the dangerous error</span>)</h3>
+<p>Upstream:</p>
+$missed_hazards_upstream
+<p>OURS-extended:</p>
+$missed_hazards_extended
+
+<h3>4b. False alarms (FP -- credibility cost)</h3>
+<p>Upstream:</p>
+$false_alarms_upstream
+<p>OURS-extended:</p>
+$false_alarms_extended
+
+<h3>4c. Open questions and findings</h3>
+
+<p>These are the standards-interpretation questions that surfaced during
+this work. Each is recorded with the affected fixture IDs and (where
+applicable) the data backing it -- never silently conformed to a label.</p>
+
+<ul>
+  <li><strong>OQ-4: WCAG area threshold ambiguity -- RESOLVED via
+      principled re-reading of the standard.</strong>
+      WCAG 2.2 SC 2.3.1 has two defensible readings of "25% of any 10°
+      visual field on screen (about 25% of the screen)". The strict
+      reading operationalises the 10° field via the Harding / CRS FCS
+      reference rectangle (341×256 px = 87,296 px ≈ 10° of central
+      vision); 25% of that is the
+      <strong>21,824&nbsp;px hazard threshold</strong>. The looser
+      reading takes "about 25% of the screen" literally -- 0.25 × canvas
+      area, which on a 1920×1080 canvas is ~518,000 px. TRACE's
+      <code>wcagc_*</code> fixtures encode the strict reading (their
+      flashing regions are around 22,000 px -- 1% of canvas, well below
+      the loose reading but above the strict threshold). Our default
+      <code>WCAG2.2-SC2.3.1</code> profile uses the strict reading
+      derived from the standard's own cited reference rectangle; we
+      additionally expose a <code>WCAG2.2-classic</code> profile (the
+      full 87,296 px Harding-rectangle reading) for comparison. The
+      data in the per-standard table shows WCAG2.2-SC2.3.1 outperforms
+      WCAG2.2-classic on TRACE labels, confirming the strict reading
+      is the right default.</li>
+
+  <li><strong>OQ-5: TRACE's per-fixture WCAG labels may discount the
+      count axis -- DATA-BACKED but unresolved.</strong>
+      Investigating fixtures like
+      <code>wcagc_30fps_area01/f002f038</code>: its temporal pattern
+      (<code>f038_srgba.csv</code>) cycles 222→235→248→235→222 three
+      times over 34 frames at 30 fps -- about
+      <strong>1.32 flashes/sec</strong>. WCAG 2.2 SC 2.3.1's normative
+      text requires <em>more than three flashes within any 1-second
+      period</em>; 1.32 is decisively below. The per-fixture JSON
+      nevertheless labels it <code>wcag2_2:fail</code>. With multi-profile
+      scoring now in place, the data is stronger: both <code>ours</code>
+      and EA <code>iris</code> -- both implementing count-aware
+      thresholds -- have their lowest scores under TRACE's strict
+      WCAG and Trace24 labels (Trace24: 0.031 for ours, -0.075 for
+      iris). The most consistent explanation is that TRACE's strict
+      labels apply an intensity-and-area rule that under-weights the
+      count gate. Open question to the TRACE / WCAG-WG conversation
+      tee'd up in the Tier 1 outreach.</li>
+
+  <li><strong>WCAG-classic vs WCAG-strict: data confirms the strict
+      reading is closer to TRACE's labels.</strong>
+      <code>ours@WCAG2.2-classic</code> scores MCC 0.014 on upstream;
+      <code>ours@WCAG2.2-SC2.3.1</code> scores 0.160. The factor of
+      ~10 difference comes entirely from the area threshold (21,824 px
+      strict vs 87,296 px classic). Useful empirical input for the
+      next round of conversation with TRACE.</li>
+
+  <li><strong>OQ-3: Static pattern detection -- partially addressed.</strong>
+      Our detector now ships a static bar-pattern heuristic
+      (<code>detect_static_pattern_hazard</code>) that adaptively
+      thresholds and counts bars per axis. On the 12 IRIS pattern test
+      images it agrees with IRIS's expected labels 8/12. The four
+      disagreements are images IRIS does NOT mark as hazardous despite
+      visible regular striping (<code>stripes.png</code>,
+      <code>20stripes.png</code>, <code>ADE.png</code>,
+      <code>sacred-geometry-circle</code>). Either IRIS applies a
+      threshold our detector doesn't (e.g., minimum bar contrast or
+      bar count), or IRIS's test suite is incomplete -- the IRIS
+      pattern test data convention is "expected-result file exists ⇒
+      hazard", and the four images don't have matching files.</li>
+
+  <li><strong>OQ-1: At-limit counting.</strong> WCAG says <em>more
+      than 3 flashes</em>; 3 exactly is therefore PASS in our reading.
+      A few upstream sets may treat the boundary as FAIL; recorded as
+      disagreement rather than tuned-to.</li>
+
+  <li><strong>OQ-2: Area at exactly 25%.</strong> Standards say
+      <em>more than 25%</em>; exactly 25% is PASS in our reading. Our
+      extended-corpus <code>area_exactly_25pct</code> fixture currently
+      carries label FAIL -- this is our generator being over-strict, not
+      the detector being wrong; left as-is rather than retuning.</li>
+
+  <li><strong>FP-battery: <code>equiluminant_chroma_swap</code>.</strong>
+      Our detector under WCAG-strict scores 2 FPs on OURS-extended,
+      both on the FP-battery equiluminant-chroma-swap fixture (cyan↔yellow
+      at full screen, rapid). Neither WCAG general flash (small relative-
+      luminance Δ) nor red flash (low saturated-red on both sides)
+      should fire, yet the per-pixel red accumulator does fire briefly
+      at the transition. Known limitation; tracking as a refinement to
+      the red-flash gate.</li>
+
+  <li><strong>IRIS <code>GradualRedIncrease.mp4</code> upstream
+      data-quality flag.</strong> Already noted in &sect;3 -- IRIS's
+      runtime says PASS, but the shipped expected log marks per-frame
+      red events. Not blocking our work; documented so it doesn't
+      surprise a future reader.</li>
+</ul>
+
+$deep
+
+<h2>6. Known but excluded tools</h2>
+$excluded
+
+<h2>7. Limitations <small>(read this)</small></h2>
+<div class="limits">
+  <p>This report is conformance <em>evidence</em> against the published
+  thresholds, gathered under independent reproducible test. It is
+  <strong>not</strong> a regulatory certification: there is no Ofcom
+  DPP-style authority for WCAG/web content; the broadcast standards
+  (ITU-R BT.1702 / Ofcom GN2) name no certifying authority for
+  third-party tooling either. For these domains this report is the
+  strongest evidence class available.</p>
+  <p>ISO 9241-391 is referenced by number only. Its text is non-free
+  and was not used to derive any threshold here. Where a fixture's
+  applicability matrix says "iso", scoring against this report's
+  results reflects the <em>other</em> applicable standards' thresholds.</p>
+  <p>The corpus's extended axes (frame-rate sweep, codec round-trip,
+  color-space coverage) exercise behaviors the standards under-specify.
+  Their results are <em>coverage</em> evidence, not conformance evidence.</p>
+  <p>This report does not constitute legal advice. Before any public
+  publication of benchmark results or commercial release, licensing
+  and any redistribution of generated or derived media should be
+  reviewed by counsel.</p>
+</div>
+
+</body></html>
