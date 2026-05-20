@@ -1,128 +1,100 @@
-"""detector/core.py — implementation of our PSE detector.
+"""detector/core.py -- implementation of our PSE detector.
 
-Per detector/THRESHOLDS.md. Each numeric constant references the clause it
-implements. No constant is tuned against benchmark labels.
+Per detector/THRESHOLDS.md. Each numeric constant references the clause
+it implements. No constant is tuned against benchmark labels.
 
-Top-level entry point: ``analyze(video_path, profile) -> Result``.
+Entry point: ``analyze(video_path, profile) -> Result``.
 
-Algorithm sketch
-----------------
-For each frame we compute:
-  * relative-luminance map ``L[y, x]`` in [0, 1] using the sRGB→linear
-    transform from WCAG 2.2 ("Relative Luminance" definition);
-  * saturated-red map ``R_sat[y, x] = max(R - max(G, B), 0)`` in [0, 255].
+Algorithm
+---------
+Per frame:
 
-Then, for each consecutive pair of frames f, f+1, we maintain a per-pixel
-*accumulator* per axis (luminance and red). Whenever the accumulator
-crosses the per-pixel threshold (`±GENERAL_FLASH_LUMINANCE_DELTA` for
-luminance, `±RED_SAT_DELTA` for red), we record a transition at that
-pixel and reset the accumulator. The number of opposing transitions in a
-1-second window divided by 2 gives the per-pixel flash count.
+1. Compute relative-luminance map L[y,x] in [0, 1] from sRGB via a
+   precomputed 256-entry LUT (the input is discrete uint8 per channel,
+   so the LUT is mathematically exact, not an approximation).
+2. Compute saturated-red map R_sat[y,x] = max(R - max(G, B), 0).
+3. For each axis (luminance, red), run one ``_axis_step``:
+   - Compute per-pixel ΔL (or ΔR) vs previous frame.
+   - Replace per-pixel Δ with the region-mean Δ of its connected
+     component on the |Δ| > frac × threshold mask (handles codec-noise
+     fragmentation; aligns with the standard's "mean over the region"
+     intent).
+   - Accumulate; on threshold crossing, gate by the WCAG darker-bound
+     (or red saturated-min) anchor check. Only reset accumulator +
+     advance anchor for pixels that pass the gate.
+   - Incrementally update a HxW int16 running sum of fires within the
+     1-second sliding window (add new fires, subtract evicted).
+4. For each axis, hazard test: if windowed-count max > threshold AND
+   any connected component of (windowed_count > threshold) exceeds the
+   area limit, mark axis FAIL.
 
-The *flashing-area* at any moment is the fraction of pixels that
-transitioned in the most recent frame. We track its rolling max over the
-1-second window; if that max ever exceeds `AREA_FRACTION_LIMIT` AND the
-per-frame mean flash count in the windowed pixels exceeded the per-second
-cap, the sequence FAILs on that axis at that timestamp.
-
-This is faithful to the standards' "more than 3 flashes per second" (count
-axis) combined with "more than 25% of any 10° visual field" (area axis)
-combined with the intensity threshold (the accumulator's threshold
-*is* the intensity threshold). All three axes must concur for FAIL.
-
-The implementation is intentionally simple and direct so a reviewer can
-trace each computation to a clause in THRESHOLDS.md.
+Each axis has one ``AxisState`` (per-pixel buffers) and one
+``AxisConfig`` (thresholds + anchor gate). The two axes share
+``_axis_step``; the loop body is therefore short.
 """
 
 from __future__ import annotations
 
-import dataclasses
 import math
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import cv2  # type: ignore
 import numpy as np
 
 
-# --- Constants (sourced from detector/THRESHOLDS.md) ------------------------
+# --- Constants (sourced from detector/THRESHOLDS.md) -----------------------
 
-# sRGB→relative-luminance transform (WCAG 2.2 "Relative Luminance").
-_SRGB_LINEAR_THRESHOLD = 0.03928
-_SRGB_LINEAR_DIVISOR   = 12.92
-_SRGB_GAMMA_OFFSET     = 0.055
-_SRGB_GAMMA_DIVISOR    = 1.055
-_SRGB_GAMMA            = 2.4
-_LUM_COEFFS            = np.array([0.0722, 0.7152, 0.2126], dtype=np.float32)  # BGR order
+# sRGB → linear LUT (WCAG 2.2 Relative Luminance definition). Input is
+# 8-bit per channel, so a 256-entry table is mathematically exact.
+_SRGB_LIN_LUT: np.ndarray = np.empty(256, dtype=np.float32)
+for _i in range(256):
+    _v = _i / 255.0
+    _SRGB_LIN_LUT[_i] = _v / 12.92 if _v <= 0.03928 else ((_v + 0.055) / 1.055) ** 2.4
 
-# Per-profile constants. Defaults are WCAG 2.2 SC 2.3.1; per detector/THRESHOLDS.md
-# the in-scope profiles share the same flash count and intensity numerics.
 
 @dataclass(frozen=True)
 class Profile:
     name: str
-    general_flash_max_per_second: int = 3   # WCAG 2.2 SC 2.3.1
-    general_flash_luminance_delta: float = 0.1   # WCAG 2.2 SC 2.3.1
-    general_flash_darker_bound: float = 0.8      # WCAG 2.2 SC 2.3.1 exception
-    area_fraction_limit: float = 0.25            # WCAG 2.2 SC 2.3.1 normative wording
-    # Absolute pixel-area limit. Defaults to "effectively disabled". The
-    # WCAG2.2-classic profile sets this to 341*256 = 87,296 px (the
-    # Harding / Cambridge Research Systems FCS reference rectangle that
-    # WCAG 2.2 SC 2.3.1's Understanding document points to). A connected
-    # hazardous region exceeding EITHER the fraction OR the pixel limit
-    # is treated as area-axis-FAIL. OQ-4 is resolved by using a profile
-    # variant that switches to this stricter pixel-area limit, NOT by
-    # tuning the default.
-    area_pixels_limit: int = 10_000_000          # effectively disabled by default
-    red_flash_max_per_second: int = 3            # WCAG 2.2 SC 2.3.1
-    red_sat_delta: int = 20                      # Harding / IRIS-equivalent
-    red_sat_min: int = 80                        # Harding minimum
-    sliding_window_seconds: float = 1.0          # WCAG 2.2 SC 2.3.1
-    # J-BA absolute cap on flashes/sec regardless of area.
+    general_flash_max_per_second: int = 3
+    general_flash_luminance_delta: float = 0.1
+    general_flash_darker_bound: float = 0.8
+    area_fraction_limit: float = 0.25
+    area_pixels_limit: int = 10_000_000  # effectively disabled by default
+    red_flash_max_per_second: int = 3
+    red_sat_delta: int = 20
+    red_sat_min: int = 80
+    sliding_window_seconds: float = 1.0
     absolute_flashes_per_second_cap: Optional[int] = None
-    # ITU-R BT.1702 / Ofcom / NAB-J pattern hazard enabled?
     pattern_hazard_enabled: bool = False
-    # Pattern hazard thresholds (ITU-R BT.1702 numerics).
-    pattern_min_bars: int = 5            # ≥ 5 light/dark bars
-    pattern_min_area_fraction: float = 0.40  # covering > 40% of visible area
+    pattern_min_bars: int = 5
+    pattern_min_area_fraction: float = 0.40
 
 
-# Reference visual-field rectangle from WCAG 2.2 SC 2.3.1 Understanding
-# (the Harding / Cambridge Research Systems FCS Implementation Guide
-# convention: 341×256 px at 1024×768 reference, representing 10° of
-# central visual field at typical viewing distance).
+# Reference visual-field rectangle (Harding / CRS FCS Implementation
+# Guide convention: 341×256 px = 10° of central vision; 25% of that =
+# 21,824 px is the WCAG-strict hazard threshold).
 _REF_RECT_W      = 341
 _REF_RECT_H      = 256
-_REF_RECT_AREA   = _REF_RECT_W * _REF_RECT_H          # 87,296 px (the full 10° field)
-_WCAG_AREA_LIMIT = int(round(0.25 * _REF_RECT_AREA))  # 21,824 px = 25% of 10° field
+_REF_RECT_AREA   = _REF_RECT_W * _REF_RECT_H
+_WCAG_AREA_LIMIT = int(round(0.25 * _REF_RECT_AREA))
 
 
 PROFILES: dict[str, Profile] = {
-    # WCAG 2.2 SC 2.3.1 — strict reading of the Understanding document.
-    # "More than 25% of any 10° of visual field on the screen" with the
-    # 10° field operationalized as the 341×256 reference rectangle
-    # (Harding / CRS FCS Implementation Guide). Threshold = ~21,824 px,
-    # which is the WCAG-strict area gate. Note this is STRICTER than the
-    # parenthetical "about 25% of the screen" wording in the same clause.
-    # See OQ-4 in detector/THRESHOLDS.md for the full discussion.
     "WCAG2.2-SC2.3.1": Profile(
         name="WCAG2.2-SC2.3.1",
-        area_fraction_limit=0.25,          # parenthetical fallback for very large canvases
+        area_fraction_limit=0.25,
         area_pixels_limit=_WCAG_AREA_LIMIT,
         pattern_hazard_enabled=True,
     ),
-    # WCAG2.2-classic — the Harding-rectangle reading (less strict than
-    # WCAG-strict above). Kept as a separate profile so callers can
-    # explicitly select either reading; the report shows both.
     "WCAG2.2-classic": Profile(
         name="WCAG2.2-classic",
-        area_fraction_limit=1.0,            # disable fraction-form
-        area_pixels_limit=_REF_RECT_AREA,    # the full 341×256 rectangle
+        area_fraction_limit=1.0,
+        area_pixels_limit=_REF_RECT_AREA,
         pattern_hazard_enabled=True,
     ),
-    # Broadcast profiles use the Harding-classic (less strict) reading.
     "ITU-R-BT.1702":    Profile(name="ITU-R-BT.1702",
                                   area_pixels_limit=_REF_RECT_AREA,
                                   pattern_hazard_enabled=True),
@@ -132,7 +104,6 @@ PROFILES: dict[str, Profile] = {
     "Trace24":          Profile(name="Trace24",
                                   area_pixels_limit=_REF_RECT_AREA,
                                   pattern_hazard_enabled=True),
-    # NAB-J: Harding-classic area + absolute count cap.
     "NAB-J":            Profile(name="NAB-J",
                                   area_pixels_limit=_REF_RECT_AREA,
                                   absolute_flashes_per_second_cap=5,
@@ -140,21 +111,21 @@ PROFILES: dict[str, Profile] = {
 }
 
 
-# --- Result types -----------------------------------------------------------
+# --- Result types ----------------------------------------------------------
 
 @dataclass
 class PerFrame:
-    frame: int                  # 1-based to align with IRIS convention
-    timestamp: float            # seconds
-    lum_transitions: int        # cumulative count up to this frame (over window)
+    frame: int
+    timestamp: float
+    lum_transitions: int
     red_transitions: int
-    flash_area: float           # area-fraction in [0, 1] of pixels actively transitioning this frame
+    flash_area: float
     pattern_risk: float = 0.0
 
 
 @dataclass
 class Result:
-    verdict: str                # "PASS" | "FAIL"
+    verdict: str
     failed_dimensions: list[str] = field(default_factory=list)
     first_fail_timestamp: Optional[float] = None
     per_frame: list[PerFrame] = field(default_factory=list)
@@ -165,22 +136,18 @@ class Result:
     n_frames: int = 0
 
 
-# --- sRGB → relative luminance ---------------------------------------------
+# --- Pixel-feature helpers -------------------------------------------------
 
 def _srgb_to_relative_luminance(bgr_uint8: np.ndarray) -> np.ndarray:
-    """Compute relative luminance map L in [0, 1] from an HxWx3 BGR uint8 image.
+    """Relative luminance L in [0, 1] from an HxWx3 BGR uint8 image.
 
-    Follows the WCAG 2.2 Relative Luminance definition exactly. Vectorized
-    with numpy; runs at ~real-time on modern hardware.
+    Uses a precomputed 256-entry LUT for the sRGB → linear step (exact,
+    since input is discrete uint8), then the WCAG-cited coefficients.
     """
-    rgb = bgr_uint8.astype(np.float32) / 255.0
-    # sRGB → linear; use np.where for the piecewise function.
-    low = rgb / _SRGB_LINEAR_DIVISOR
-    high = ((rgb + _SRGB_GAMMA_OFFSET) / _SRGB_GAMMA_DIVISOR) ** _SRGB_GAMMA
-    linear = np.where(rgb <= _SRGB_LINEAR_THRESHOLD, low, high)
-    # BGR coefficients (we kept the BGR order from cv2).
-    L = linear @ _LUM_COEFFS
-    return L.astype(np.float32)
+    b_lin = _SRGB_LIN_LUT[bgr_uint8[..., 0]]
+    g_lin = _SRGB_LIN_LUT[bgr_uint8[..., 1]]
+    r_lin = _SRGB_LIN_LUT[bgr_uint8[..., 2]]
+    return (0.2126 * r_lin + 0.7152 * g_lin + 0.0722 * b_lin).astype(np.float32)
 
 
 def _saturated_red(bgr_uint8: np.ndarray) -> np.ndarray:
@@ -190,21 +157,10 @@ def _saturated_red(bgr_uint8: np.ndarray) -> np.ndarray:
     r = bgr_uint8[..., 2].astype(np.int16)
     sat = r - np.maximum(g, b)
     np.clip(sat, 0, 255, out=sat)
-    return sat.astype(np.int16)
+    return sat.astype(np.float32)
 
 
-# --- Per-pixel transition accumulator --------------------------------------
-#
-# For each pixel we maintain a running signed accumulator on each axis.
-# When the absolute value of the accumulator crosses the per-pixel threshold
-# (intensity threshold for that axis), we count a transition at that pixel
-# in the direction of the accumulator's sign and reset.
-#
-# This implements the "opposing-change" rule (a flash is a *pair* of
-# transitions in opposing directions) at pixel granularity: a sustained
-# drift in one direction can only contribute one transition before reset.
-# The 1-second windowed count of transitions at a pixel divided by 2 is
-# that pixel's flash rate.
+# --- Region-level ΔL aggregation -------------------------------------------
 
 def _regional_delta(delta: np.ndarray,
                     intensity_threshold: float,
@@ -214,13 +170,8 @@ def _regional_delta(delta: np.ndarray,
     connected component in the active mask (|delta| > frac × threshold).
 
     Pixels not in any significant component keep their original delta.
-    The effect: all pixels in a uniformly-flashing region see the same
-    ΔL each frame, so they fire (or don't) together. This addresses the
-    codec-noise fragmentation issue where a uniform real-world flash
-    region produces inconsistent per-pixel ΔL values that cause the
-    downstream area test to under-count.
-
-    Operates on signed delta (preserves sign of the region's net move).
+    Aligns the per-pixel signal with the standards' region-mean intent
+    and resists codec-noise fragmentation.
     """
     active = np.abs(delta) > intensity_threshold * active_threshold_frac
     if not active.any():
@@ -232,86 +183,112 @@ def _regional_delta(delta: np.ndarray,
         return delta
     out = delta.copy()
     for li in range(1, n_labels):
-        area = int(stats[li, cv2.CC_STAT_AREA])
-        if area < min_region_area_px:
+        if int(stats[li, cv2.CC_STAT_AREA]) < min_region_area_px:
             continue
         region_mask = labels == li
-        region_mean = float(delta[region_mask].mean())
-        out[region_mask] = region_mean
+        out[region_mask] = float(delta[region_mask].mean())
     return out
-
-
-def _update_transitions(acc: np.ndarray,
-                        delta: np.ndarray,
-                        threshold: float) -> np.ndarray:
-    """Update the accumulator and return a boolean mask of pixels that
-    completed an opposing-transition step this frame."""
-    acc += delta
-    # Where |acc| has crossed the threshold, count a transition and reset.
-    fired_pos = acc >=  threshold
-    fired_neg = acc <= -threshold
-    fired = fired_pos | fired_neg
-    # Reset accumulator at fired pixels.
-    acc[fired] = 0.0
-    return fired
 
 
 # --- Region-aware area decision --------------------------------------------
 
 def _region_exceeds_area(hazard_mask: np.ndarray, n_pixels: int,
                          fraction_limit: float, pixels_limit: int) -> bool:
-    """True iff any single connected component of ``hazard_mask`` exceeds
-    EITHER the screen-fraction limit OR the absolute pixel-area limit.
-
-    This implements the "the flashing region" wording of the standards:
-    we look for a *contiguous* hazardous region, not the union of
-    disconnected hazardous pixels. Many small independently-flashing
-    regions (each below threshold) do NOT compose into a single hazard.
-
-    cv2.connectedComponentsWithStats is O(n_pixels) and returns per-label
-    area in stats[:, cv2.CC_STAT_AREA] in pixels. Label 0 is background.
-    """
+    """True iff any connected component of ``hazard_mask`` exceeds EITHER
+    the screen-fraction limit OR the absolute pixel-area limit."""
     if not hazard_mask.any():
         return False
-    n_labels, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+    n_labels, _labels, stats, _ = cv2.connectedComponentsWithStats(
         hazard_mask.astype(np.uint8), connectivity=8
     )
     if n_labels <= 1:
         return False
-    # stats[0] is background; skip it.
-    areas = stats[1:, cv2.CC_STAT_AREA]
-    max_area = int(areas.max())
-    max_area_frac = max_area / n_pixels
-    return (max_area > pixels_limit) or (max_area_frac > fraction_limit)
+    max_area = int(stats[1:, cv2.CC_STAT_AREA].max())
+    return (max_area > pixels_limit) or ((max_area / n_pixels) > fraction_limit)
+
+
+# --- Per-axis pipeline -----------------------------------------------------
+
+AnchorGate = Callable[[np.ndarray, np.ndarray], np.ndarray]
+
+
+@dataclass
+class AxisConfig:
+    """Algorithmic parameters for one axis (luminance or red)."""
+    threshold: float                       # accumulator fires above this magnitude
+    count_per_second_limit: int            # WCAG-style "more than N flashes/sec"
+    active_threshold_frac: float = 0.25    # for _regional_delta
+    region_min_area_px: int = 100          # for _regional_delta
+    anchor_gate: Optional[AnchorGate] = None  # None = always allow fire
+
+
+@dataclass
+class AxisState:
+    """Per-pixel state for one axis, mutated in place each frame."""
+    acc: np.ndarray            # signed accumulator (HxW float32)
+    anchor: np.ndarray         # signal value at last successful fire (HxW float32)
+    window: deque              # deque of per-frame fired masks (bool HxW)
+    window_counts: np.ndarray  # incremental running sum of fires in window (HxW int16)
+
+    @classmethod
+    def initial(cls, h: int, w: int, window_frames: int) -> "AxisState":
+        return cls(
+            acc=np.zeros((h, w), dtype=np.float32),
+            anchor=np.zeros((h, w), dtype=np.float32),
+            window=deque(maxlen=window_frames),
+            window_counts=np.zeros((h, w), dtype=np.int16),
+        )
+
+
+def _axis_step(state: AxisState, prev_signal: np.ndarray,
+               signal: np.ndarray, cfg: AxisConfig) -> np.ndarray:
+    """Advance one axis by one frame. Mutates ``state`` in place; returns
+    the boolean mask of pixels that fired this frame (post-gate)."""
+    delta = signal - prev_signal
+    delta = _regional_delta(delta, cfg.threshold,
+                            cfg.active_threshold_frac, cfg.region_min_area_px)
+
+    state.acc += delta
+    crossed = (state.acc >= cfg.threshold) | (state.acc <= -cfg.threshold)
+
+    if cfg.anchor_gate is not None:
+        fired = crossed & cfg.anchor_gate(signal, state.anchor)
+    else:
+        fired = crossed
+
+    # Reset and advance anchor ONLY for fired pixels (not for pixels that
+    # crossed but failed the gate -- otherwise codec-smeared transitions
+    # discard their residual mid-flight).
+    state.acc[fired] = 0.0
+    state.anchor[fired] = signal[fired]
+
+    # Incremental sliding-window count: subtract the evicted frame's
+    # fires (if window is full) before appending the new fires.
+    if len(state.window) == state.window.maxlen:
+        state.window_counts -= state.window[0].astype(np.int16)
+    state.window.append(fired)
+    state.window_counts += fired.astype(np.int16)
+
+    return fired
+
+
+def _axis_hazard(state: AxisState, count_threshold: int, n_pixels: int,
+                 fraction_limit: float, pixels_limit: int) -> bool:
+    """True iff this axis is in a hazardous state THIS frame: some pixel
+    has windowed_count > count_threshold AND that hazardous region
+    exceeds the area limit. Early-exit on the cheap max() check."""
+    if int(state.window_counts.max()) <= count_threshold:
+        return False
+    hazard_mask = state.window_counts > count_threshold
+    return _region_exceeds_area(hazard_mask, n_pixels, fraction_limit, pixels_limit)
 
 
 # --- Static spatial-pattern detection (ITU-R BT.1702 §3) -------------------
-#
-# A "regular pattern" hazard is ≥ pattern_min_bars approximately-equally-
-# spaced light/dark bars covering more than pattern_min_area_fraction of
-# the visible area. We detect this on a single still frame via:
-#   1. Convert to grayscale L map.
-#   2. Adaptive threshold → binary.
-#   3. Sum along each axis → 1D intensity profiles (rows, cols).
-#   4. Count zero-crossings of the row/col profile relative to its mean.
-#      ≥ 2*N zero-crossings means at least N bar transitions.
-#   5. Estimate covered area as the bounding box of the high-variance band.
-#
-# This is intentionally simple. The IRIS approach uses Hough lines plus
-# circular-pattern detection (their CircularExpectedResults dir). The
-# simple-bar detection here handles the bulk of the test images
-# (stripes.png, ChessBoard.png, HorizontalLines.jpg, Diagonals.png).
-# Open question OQ-3 in THRESHOLDS.md now narrows to: more sophisticated
-# patterns (kaleidoscopes, sacred-geometry overlays) may still be missed.
 
 def detect_static_pattern_hazard(image_path: Path,
                                   profile: str = "ITU-R-BT.1702"
                                   ) -> tuple[bool, dict]:
-    """Return (is_hazardous, info) for a still image under ``profile``.
-
-    ``info`` contains diagnostic numbers: bar_count (max of horizontal/
-    vertical), covered_area_fraction, and the axis that dominated.
-    """
+    """Return (is_hazardous, info) for a still image under ``profile``."""
     p = PROFILES[profile]
     if not p.pattern_hazard_enabled:
         return False, {"reason": "pattern_hazard disabled in profile",
@@ -323,41 +300,25 @@ def detect_static_pattern_hazard(image_path: Path,
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
 
-    # Adaptive threshold isolates light/dark bars without committing to a
-    # global mean (handles vignetted or non-uniform-background patterns).
     binarized = cv2.adaptiveThreshold(
         gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY,
-        blockSize=max(15, (min(h, w) // 32) | 1),  # odd
-        C=2,
+        blockSize=max(15, (min(h, w) // 32) | 1), C=2,
     )
 
-    # Count bar transitions along each axis. A "transition" is a flip in
-    # the binarized signal across the axis-projected mean.
     def _bar_count_and_band(profile_1d: np.ndarray) -> tuple[int, tuple[int, int]]:
-        m = profile_1d.mean()
-        sign = (profile_1d > m).astype(np.int8)
+        sign = (profile_1d > profile_1d.mean()).astype(np.int8)
         diffs = np.abs(np.diff(sign))
         n_transitions = int(diffs.sum())
-        # The "band" containing the pattern: the region of the projection
-        # where the signal is meaningfully oscillating. Approximate by the
-        # min..max indices of the high-variance window.
         if n_transitions == 0:
             return 0, (0, 0)
-        nonzero = np.nonzero(diffs)[0]
-        return n_transitions // 2, (int(nonzero[0]), int(nonzero[-1]))
+        nz = np.nonzero(diffs)[0]
+        return n_transitions // 2, (int(nz[0]), int(nz[-1]))
 
-    row_profile = binarized.mean(axis=1)  # length h: vertical-bar detector
-    col_profile = binarized.mean(axis=0)  # length w: horizontal-bar detector
-    v_bars, (vy0, vy1) = _bar_count_and_band(col_profile)
-    h_bars, (hx0, hx1) = _bar_count_and_band(row_profile)
+    v_bars, (vy0, vy1) = _bar_count_and_band(binarized.mean(axis=0))
+    h_bars, (hx0, hx1) = _bar_count_and_band(binarized.mean(axis=1))
 
-    # Area coverage estimate: the bounding box of the high-variance band
-    # on the dominant axis, projected over the other axis (assume the
-    # pattern fills the orthogonal direction). This over-estimates for
-    # diagonals, which is conservative for FAIL.
     if v_bars >= h_bars:
         bar_count = v_bars
-        # vertical bars: pattern spans full height, between vy0..vy1 cols
         coverage_px = (vy1 - vy0 + 1) * h
         dominant_axis = "vertical"
     else:
@@ -379,13 +340,9 @@ def detect_static_pattern_hazard(image_path: Path,
     }
 
 
-# --- Main analyzer ----------------------------------------------------------
+# --- Main analyzer ---------------------------------------------------------
 
 def analyze(video_path: Path, profile: str = "WCAG2.2-SC2.3.1") -> Result:
-    """Open ``video_path`` and run the PSE analysis under the given profile.
-
-    Returns a Result with verdict + failed dimensions + per-frame trace.
-    """
     if profile not in PROFILES:
         raise ValueError(f"unknown profile {profile!r}; known: {sorted(PROFILES)}")
     p = PROFILES[profile]
@@ -396,8 +353,6 @@ def analyze(video_path: Path, profile: str = "WCAG2.2-SC2.3.1") -> Result:
     fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    n_frames_hint = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-
     if fps <= 0:
         cap.release()
         raise IOError(f"video has no usable fps metadata: {video_path}")
@@ -405,49 +360,39 @@ def analyze(video_path: Path, profile: str = "WCAG2.2-SC2.3.1") -> Result:
     n_pixels = max(1, width * height)
     window_frames = max(1, int(round(p.sliding_window_seconds * fps)))
 
-    # Region-level ΔL aggregation. Real-world mp4v / H.264 codec noise
-    # introduces small per-pixel residuals across an otherwise uniformly-
-    # flashing region; those residuals cause individual pixels to fire one
-    # frame early or late, and the (windowed_count > 6) mask used by the
-    # area test fragments into components too small to exceed the area
-    # threshold. The fix: identify candidate flash regions per frame via
-    # connected components on the |ΔL| > threshold/4 mask, and within each
-    # region, replace each pixel's ΔL with the region's mean ΔL. Pixels in
-    # the same region then fire (or don't) together, giving a clean hazard
-    # mask that the area test can read correctly. This is conceptually the
-    # same operation Dr. Jordan's reference chart for f002f038 uses: one
-    # luminance value per frame, derived from the region's pixels.
-    _region_min_area_px = 100   # ignore tiny components; pixel grit, not regions
-    _active_threshold_frac = 0.25  # |ΔL| > this * intensity_threshold ⇒ "active"
+    # Per-axis configuration. The gates close over Profile values; both
+    # axes' gates use the symmetric "darker endpoint of the flash pair"
+    # logic, the luminance version with a min threshold, the red version
+    # with a max threshold (we want the brighter red value to clear
+    # Harding's saturated-red minimum).
+    lum_gate = (
+        (lambda L_cur, L_anch: np.minimum(L_cur, L_anch) < p.general_flash_darker_bound)
+        if p.general_flash_darker_bound < 1.0 else None
+    )
+    red_gate = (
+        (lambda R_cur, R_anch: np.maximum(R_cur, R_anch) >= p.red_sat_min)
+        if p.red_sat_min > 0 else None
+    )
+    lum_cfg = AxisConfig(
+        threshold=p.general_flash_luminance_delta,
+        count_per_second_limit=p.general_flash_max_per_second,
+        anchor_gate=lum_gate,
+    )
+    red_cfg = AxisConfig(
+        threshold=float(p.red_sat_delta),
+        count_per_second_limit=p.red_flash_max_per_second,
+        anchor_gate=red_gate,
+    )
+    lum_state = AxisState.initial(height, width, window_frames)
+    red_state = AxisState.initial(height, width, window_frames)
 
-    # Per-pixel accumulators (float32 saves memory).
-    lum_acc = np.zeros((height, width), dtype=np.float32)
-    red_acc = np.zeros((height, width), dtype=np.float32)
+    lum_count_thresh = 2 * lum_cfg.count_per_second_limit
+    red_count_thresh = 2 * red_cfg.count_per_second_limit
+    abs_cap = (2 * p.absolute_flashes_per_second_cap
+               if p.absolute_flashes_per_second_cap is not None else None)
 
-    # Per-pixel anchor luminance: the L value at the last accumulator
-    # reset. The WCAG darker-bound exception is about the darker endpoint
-    # of the FLASH PAIR (baseline vs peak), not the darker of two
-    # consecutive frames. Tracking the anchor lets us compare L_current
-    # against L_at_last_reset rather than L_prev. For burst pattern
-    # 222→235→248→222 (relative L 0.72→0.82→0.92→0.72), the relevant
-    # pair for the up-half is (0.72, 0.92) -- min 0.72 < 0.8, counted --
-    # not (0.82, 0.92) which would be incorrectly dropped.
-    L_anchor = np.zeros((height, width), dtype=np.float32)
-    R_anchor = np.zeros((height, width), dtype=np.float32)
-    _anchor_initialized = False
-
-    # Previous-frame maps (for diffs).
     prev_L: Optional[np.ndarray] = None
     prev_R: Optional[np.ndarray] = None
-    # For the WCAG "darker image" exemption: we track a per-pixel previous L
-    # so we can check that the darker of the two endpoints is < 0.8.
-    # The check is approximate at pixel granularity; we evaluate it on
-    # the *contributing pixels* at transition time.
-
-    # Sliding-window per-pixel transition counts (for the 1-second window).
-    lum_trans_window: deque[np.ndarray] = deque(maxlen=window_frames)
-    red_trans_window: deque[np.ndarray] = deque(maxlen=window_frames)
-
     per_frame: list[PerFrame] = []
     failed_dims: set[str] = set()
     first_fail_ts: Optional[float] = None
@@ -464,120 +409,42 @@ def analyze(video_path: Path, profile: str = "WCAG2.2-SC2.3.1") -> Result:
         R = _saturated_red(frame)
 
         if prev_L is None:
-            prev_L = L
-            prev_R = R
-            L_anchor = L.copy()
-            R_anchor = R.astype(np.float32).copy()
-            _anchor_initialized = True
+            prev_L, prev_R = L, R
+            lum_state.anchor[:] = L
+            red_state.anchor[:] = R
             per_frame.append(PerFrame(frame=frame_idx, timestamp=timestamp,
                                        lum_transitions=0, red_transitions=0,
                                        flash_area=0.0))
             continue
 
-        lum_delta = L - prev_L                                # signed, in luminance units
-        red_delta = R.astype(np.float32) - prev_R.astype(np.float32)  # signed, in [-255, 255]
+        lum_fired = _axis_step(lum_state, prev_L, L, lum_cfg)
+        red_fired = _axis_step(red_state, prev_R, R, red_cfg)
 
-        # Region-level ΔL: replace each pixel's ΔL with its connected
-        # component's mean ΔL (where the component is identified on the
-        # |ΔL| > frac × threshold mask). See block comment above analyze()'s
-        # _region_min_area_px constant for the rationale (Jordan
-        # correspondence 2026-05-20).
-        lum_delta = _regional_delta(
-            lum_delta, p.general_flash_luminance_delta,
-            _active_threshold_frac, _region_min_area_px,
-        )
-        red_delta = _regional_delta(
-            red_delta, float(p.red_sat_delta),
-            _active_threshold_frac, _region_min_area_px,
-        )
-
-        # Luminance accumulator + gates. Important sequencing: we must
-        # only reset the accumulator for pixels that actually fire
-        # (passed darker_ok), not for every pixel whose accumulator
-        # crossed threshold. Otherwise codec smearing across a 2-frame
-        # transition (peak → mid → baseline) causes the threshold
-        # crossing at the mid frame to reset the accumulator and discard
-        # the residual that would have completed the transition at the
-        # baseline frame.
-        lum_acc += lum_delta
-        lum_crossed = (lum_acc >= p.general_flash_luminance_delta) | \
-                      (lum_acc <= -p.general_flash_luminance_delta)
-        if p.general_flash_darker_bound < 1.0:
-            darker_ok = np.minimum(L, L_anchor) < p.general_flash_darker_bound
-            lum_fired = lum_crossed & darker_ok
-        else:
-            lum_fired = lum_crossed
-        lum_acc[lum_fired] = 0.0
-        L_anchor[lum_fired] = L[lum_fired]
-
-        # Red accumulator + gates. Symmetric structure.
-        red_acc += red_delta
-        red_crossed = (red_acc >= float(p.red_sat_delta)) | \
-                      (red_acc <= -float(p.red_sat_delta))
-        if p.red_sat_min > 0:
-            R_f32 = R.astype(np.float32) if R.dtype != np.float32 else R
-            larger_red = np.maximum(R_f32, R_anchor)
-            red_ok = larger_red >= p.red_sat_min
-            red_fired = red_crossed & red_ok
-        else:
-            red_fired = red_crossed
-        red_acc[red_fired] = 0.0
-        R_f32_for_anchor = R.astype(np.float32) if R.dtype != np.float32 else R
-        R_anchor[red_fired] = R_f32_for_anchor[red_fired]
-
-        # Update windowed transitions.
-        lum_trans_window.append(lum_fired)
-        red_trans_window.append(red_fired)
-
-        # Per-frame area-fraction = pixels that fired this frame / total.
-        lum_area_frac_now = float(lum_fired.sum()) / n_pixels
-        red_area_frac_now = float(red_fired.sum()) / n_pixels
-        flash_area_now = max(lum_area_frac_now, red_area_frac_now)
-
-        # Per-pixel transition counts in the rolling window.
-        lum_counts = np.sum(np.stack(lum_trans_window, axis=0).astype(np.int16), axis=0)
-        red_counts = np.sum(np.stack(red_trans_window, axis=0).astype(np.int16), axis=0)
-
-        # "More than 3 flashes" = more than 6 transitions (two transitions/flash).
-        lum_hazard_mask = lum_counts > (2 * p.general_flash_max_per_second)
-        red_hazard_mask = red_counts > (2 * p.red_flash_max_per_second)
-
-        # Region-aware area decision (replaces the naive screen-fraction sum).
-        # Standards talk about "the flashing region" — singular, contiguous,
-        # over a 10° visual field. We extract connected components per axis
-        # and check whether ANY single region exceeds the area threshold
-        # (fraction OR absolute pixel limit, whichever is configured).
-        # Multi-region content with many small independently-flashing areas
-        # that individually fall under the limit is correctly PASSed.
-        if "luminance" not in failed_dims and _region_exceeds_area(
-                lum_hazard_mask, n_pixels, p.area_fraction_limit, p.area_pixels_limit):
+        if "luminance" not in failed_dims and _axis_hazard(
+                lum_state, lum_count_thresh, n_pixels,
+                p.area_fraction_limit, p.area_pixels_limit):
             failed_dims.add("luminance")
             if first_fail_ts is None: first_fail_ts = timestamp
-        if "red" not in failed_dims and _region_exceeds_area(
-                red_hazard_mask, n_pixels, p.area_fraction_limit, p.area_pixels_limit):
+        if "red" not in failed_dims and _axis_hazard(
+                red_state, red_count_thresh, n_pixels,
+                p.area_fraction_limit, p.area_pixels_limit):
             failed_dims.add("red")
             if first_fail_ts is None: first_fail_ts = timestamp
-
-        # J-BA absolute cap (if profile enables it).
-        if p.absolute_flashes_per_second_cap is not None:
-            cap_trans = 2 * p.absolute_flashes_per_second_cap
-            # Any pixel exceeding the absolute cap fails regardless of area.
-            if bool(np.any(lum_counts > cap_trans)) or bool(np.any(red_counts > cap_trans)):
-                if "count" not in failed_dims:
-                    failed_dims.add("count")
-                    if first_fail_ts is None: first_fail_ts = timestamp
+        if abs_cap is not None and "count" not in failed_dims:
+            if (int(lum_state.window_counts.max()) > abs_cap or
+                int(red_state.window_counts.max()) > abs_cap):
+                failed_dims.add("count")
+                if first_fail_ts is None: first_fail_ts = timestamp
 
         per_frame.append(PerFrame(
             frame=frame_idx, timestamp=timestamp,
-            lum_transitions=int(lum_counts.max()) if lum_counts.size else 0,
-            red_transitions=int(red_counts.max()) if red_counts.size else 0,
-            flash_area=flash_area_now,
+            lum_transitions=int(lum_state.window_counts.max()),
+            red_transitions=int(red_state.window_counts.max()),
+            flash_area=max(float(lum_fired.sum()), float(red_fired.sum())) / n_pixels,
         ))
-
         prev_L, prev_R = L, R
 
     cap.release()
-
     return Result(
         verdict="FAIL" if failed_dims else "PASS",
         failed_dimensions=sorted(failed_dims),
@@ -591,7 +458,7 @@ def analyze(video_path: Path, profile: str = "WCAG2.2-SC2.3.1") -> Result:
     )
 
 
-# --- CLI --------------------------------------------------------------------
+# --- CLI -------------------------------------------------------------------
 
 def _main_cli(argv: list[str]) -> int:
     import argparse, json
@@ -600,7 +467,7 @@ def _main_cli(argv: list[str]) -> int:
                     help="Input video. Optional only when --self-test is set.")
     ap.add_argument("--profile", default="WCAG2.2-SC2.3.1", choices=list(PROFILES))
     ap.add_argument("--per-frame-csv", type=Path, default=None,
-                    help="Optional path to write a per-frame CSV matching the harness contract.")
+                    help="Optional path to write a per-frame CSV.")
     ap.add_argument("--self-test", action="store_true",
                     help="Quick smoke self-test on a tiny synthetic video.")
     args = ap.parse_args(argv)
@@ -609,16 +476,15 @@ def _main_cli(argv: list[str]) -> int:
         return _self_test()
 
     res = analyze(args.video, args.profile)
-    out = {
-        "video":               str(args.video),
-        "profile":             res.profile_name,
-        "verdict":             res.verdict,
-        "failed_dimensions":   res.failed_dimensions,
+    print(json.dumps({
+        "video":                str(args.video),
+        "profile":              res.profile_name,
+        "verdict":              res.verdict,
+        "failed_dimensions":    res.failed_dimensions,
         "first_fail_timestamp": res.first_fail_timestamp,
-        "fps":                 res.fps,
-        "n_frames":            res.n_frames,
-    }
-    print(json.dumps(out, indent=2))
+        "fps":                  res.fps,
+        "n_frames":             res.n_frames,
+    }, indent=2))
 
     if args.per_frame_csv:
         import csv
@@ -634,44 +500,31 @@ def _main_cli(argv: list[str]) -> int:
 
 
 def _self_test() -> int:
-    """Synthesize a tiny full-screen alternating clip and confirm verdicts.
-
-    This is a smoke test only — it intentionally uses two synthetic clips
-    whose label derives from generation parameters analytically. It does
-    NOT use any benchmark fixture; running it does not violate the
-    no-tuning-against-labels rule.
-    """
+    """Smoke test on two synthetic videos labelled analytically (not from
+    any benchmark fixture)."""
     import tempfile, shutil
     tmp = Path(tempfile.mkdtemp(prefix="detector_selftest_"))
     try:
-        passing = tmp / "two_hz.mp4"      # 2 flashes/sec → PASS
-        failing = tmp / "five_hz.mp4"     # 5 flashes/sec → FAIL
+        passing = tmp / "two_hz.mp4"
+        failing = tmp / "five_hz.mp4"
         for path, hz in ((passing, 2.0), (failing, 5.0)):
             writer = cv2.VideoWriter(str(path),
                                       cv2.VideoWriter_fourcc(*"mp4v"),
                                       30.0, (320, 240))
-            for fi in range(int(2 * 30)):  # 2 seconds at 30fps
-                t = fi / 30.0
-                state = int(t * 2 * hz) % 2
+            for fi in range(int(2 * 30)):
+                state = int((fi / 30.0) * 2 * hz) % 2
                 img = np.full((240, 320, 3), 255 if state else 0, dtype=np.uint8)
                 writer.write(img)
             writer.release()
         r_pass = analyze(passing)
         r_fail = analyze(failing)
-        print(f"self-test: 2Hz → {r_pass.verdict} (expect PASS); "
-              f"5Hz → {r_fail.verdict} (expect FAIL); dims={r_fail.failed_dimensions}")
-        ok = (r_pass.verdict == "PASS") and (r_fail.verdict == "FAIL")
-        return 0 if ok else 1
+        print(f"self-test: 2Hz -> {r_pass.verdict} (expect PASS); "
+              f"5Hz -> {r_fail.verdict} (expect FAIL); dims={r_fail.failed_dimensions}")
+        return 0 if (r_pass.verdict == "PASS" and r_fail.verdict == "FAIL") else 1
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":
-    import sys
-    raise SystemExit(_main_cli(sys.argv[1:]))
-
-
-# Allow ``python -m detector`` as a convenient alias for the CLI.
-def __main_module__() -> None:  # pragma: no cover
     import sys
     raise SystemExit(_main_cli(sys.argv[1:]))
