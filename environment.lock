@@ -1,0 +1,59 @@
+# environment.lock — exact versions required for reproducible scoring.
+#
+# Near-threshold PSE cases are pixel-sensitive. Codec/library version drift
+# can flip a verdict. Treat this file as part of the test fixture itself.
+#
+# This file is populated by the Dockerfile build and corpus/build_trace_videos.sh
+# at first run. The values below are the *intended* pins; the Dockerfile is
+# the authoritative source.
+
+[python]
+version = "3.11.9"                  # IRIS C++ build chain coexists with this
+
+[pip]
+# Pinned exact versions for TRACE video generation. Any of these changing
+# can shift a near-threshold result.
+opencv-python      = "4.10.0.84"
+numpy              = "1.26.4"
+Pillow             = "10.4.0"
+imageio            = "2.34.2"
+imageio-ffmpeg     = "0.5.1"
+
+[ffmpeg]
+# System binary; not linked. Used for: (1) ffmpeg_photosensitivity adapter,
+# (2) codec round-trip fixture generation.
+version = "n6.1.1"                  # pin via Docker base image
+photosensitivity_filter_present = true
+
+[iris]
+upstream = "https://github.com/electronicarts/IRIS"
+commit   = "d96978ac1107f3463b77f69a9c1b1ec5d45291a0"   # 2025-01-14
+build    = "cmake --preset linux-release"               # see Dockerfile; needs vcpkg
+
+[trace_pse_test_media]
+upstream = "https://github.com/traceRERC/pse-test-media"
+commit   = "edf799a15cc1a8817a58c0120a7b25b2b28a1932"   # 2025-08-11
+
+[trace_pse_guidelines]
+upstream = "https://github.com/traceRERC/pseGuidelines"
+commit   = "48d0c20f22a3333f64f444159b52c8c9eb097c71"   # 2024-12-17
+
+[apple_vfr]
+upstream = "https://github.com/apple/VideoFlashingReduction"
+commit   = "7357d2f347c8659cc5ab4804b1338cfb0e95f362"   # 2023-05-10
+canonical_fixture_sha256 = "896551b3857a8096d0243046ce21655f858a1e3310d5cf8b43156504b071a25b"
+# All three Apple sub-projects ship byte-identical movie.mp4 (verified at clone time).
+
+[iris_unreal]
+upstream = "https://github.com/electronicarts/IRIS-Unreal-Plugin"
+commit   = "85311532a588d951b833a7b942234bcc9b578bd1"   # 2024-11-22
+disposition = "documented; excluded from automated scoring (not headless-runnable)"
+
+[os]
+# Docker base — pin by image digest, not tag, so reproducibility is real.
+base_image       = "debian:bookworm-slim"
+base_image_digest = "TBD-pin-at-docker-build"
+
+[determinism]
+seed             = 0
+notes = "All randomness in fixture generation and detector must use this seed. Same checkout must produce identical scores on any machine."
