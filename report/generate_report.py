@@ -34,7 +34,32 @@ from typing import Iterable
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+# Map each standard-slug column to the profile name a tool should have
+# been run with to produce a sound score against that standard's labels.
+# Inverse of harness.scoring.PROFILE_TO_STANDARD_SLUG (canonicalised --
+# WCAG2.2-classic also maps to wcag2.2-sc2.3.1 in that direction but we
+# default the WCAG column to WCAG2.2-SC2.3.1 for the per-standard table).
+STANDARD_TO_CANONICAL_PROFILE = {
+    "wcag2.2-sc2.3.1": "WCAG2.2-SC2.3.1",
+    "trace24":         "Trace24",
+    "itu-r-bt.1702":   "ITU-R-BT.1702",
+    "ofcom-gn2":       "Ofcom-GN2-Annex1",
+    "nab-j":           "NAB-J",
+    "iso9241-391":     None,  # not implemented by any of our profiles
+}
+
+
 # --- Helpers ---------------------------------------------------------------
+
+def _adapter_names(scores: dict) -> list[str]:
+    """Extract unique adapter names from per_tool keys formatted
+    ``adapter@profile``. Tools that ran under a single (legacy) key
+    without `@` are kept as-is."""
+    names: set[str] = set()
+    for k in scores["per_tool"]:
+        names.add(k.split("@", 1)[0])
+    return sorted(names)
+
 
 def _fmt(x, places=3):
     if x is None: return "—"
@@ -78,23 +103,32 @@ def _summary_table(scores: dict, source_filter: str, title: str) -> str:
 
 
 def _per_standard_table(scores: dict, source_filter: str) -> str:
-    standards = ["wcag2.2-sc2.3.1", "itu-r-bt.1702", "ofcom-gn2", "trace24", "iso9241-391", "nab-j"]
-    cols = []
+    """Cross-cut: rows are adapters, columns are standards. Each cell
+    uses the result from ``<adapter>@<profile-that-matches-this-standard>``
+    -- i.e. the tool's run under the right profile for the column.
+    Empty cell means the tool wasn't run under a profile that maps to
+    that standard."""
+    standards = ["wcag2.2-sc2.3.1", "itu-r-bt.1702", "ofcom-gn2", "trace24", "nab-j", "iso9241-391"]
     header_cells = "".join(f"<th>{html.escape(s)}</th>" for s in standards)
     rows = []
-    for tool in sorted(scores["per_tool"]):
-        cells = [f"<td><code>{html.escape(tool)}</code></td>"]
+    for adapter in _adapter_names(scores):
+        cells = [f"<td><code>{html.escape(adapter)}</code></td>"]
         for std in standards:
-            b = scores["per_tool"][tool].get(f"source+standard:{source_filter}/{std}")
+            profile = STANDARD_TO_CANONICAL_PROFILE.get(std)
+            tool_key = f"{adapter}@{profile}" if profile else adapter
+            tool_bucket_map = scores["per_tool"].get(tool_key, {})
+            b = tool_bucket_map.get(f"source+standard:{source_filter}/{std}")
             if not b or not b.get("fixture_count"):
                 cells.append("<td class='num'>—</td>")
             else:
                 mcc = b.get("mcc")
                 fn = b.get("fn", 0)
-                fn_marker = " ⚠" if fn > 0 else ""
                 fp = b.get("fp", 0)
+                n = b.get("fixture_count", 0)
+                fn_marker = " ⚠" if fn > 0 else ""
+                title = f"profile={profile} N={n} FN={fn} FP={fp}"
                 cells.append(
-                    f"<td class='num' title='FN={fn}, FP={fp}'>"
+                    f"<td class='num' title='{html.escape(title)}'>"
                     f"{_fmt(mcc)}{fn_marker}</td>"
                 )
         rows.append("<tr>" + "".join(cells) + "</tr>")
@@ -103,7 +137,9 @@ def _per_standard_table(scores: dict, source_filter: str) -> str:
         f"<thead><tr><th>Tool</th>{header_cells}</tr></thead>"
         f"<tbody>{''.join(rows)}</tbody></table>"
         "<p class='caption'>MCC per standard for the "
-        f"<em>{html.escape(source_filter)}</em> subset. ⚠ = FN&nbsp;&gt;&nbsp;0 (missed hazards) in that slice.</p>"
+        f"<em>{html.escape(source_filter)}</em> subset. Each cell uses the "
+        f"tool's run under the canonical profile for that standard. "
+        f"⚠ = FN&nbsp;&gt;&nbsp;0 (missed hazards) in that slice.</p>"
     )
 
 

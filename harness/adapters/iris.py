@@ -34,6 +34,21 @@ from harness.schema import NormalizedResult
 
 TOOL = "iris"
 
+# IRIS has no runtime profile switch -- its behavior is fixed by the
+# appsettings.json compiled in at build time (which implements
+# broadcast/Trace24-flavoured thresholds, not WCAG-strict). We still want
+# its single verdict cross-checked against each standard's labels in the
+# per-standard table, so we declare SUPPORTED_PROFILES but flag
+# PROFILE_AFFECTS_BEHAVIOR=False so the runner runs IRIS once per fixture
+# and replicates that single result under each profile name.
+SUPPORTED_PROFILES = [
+    "WCAG2.2-SC2.3.1",
+    "Trace24",
+    "ITU-R-BT.1702",
+    "Ofcom-GN2-Annex1",
+]
+PROFILE_AFFECTS_BEHAVIOR = False
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 # The example app is built as the `IrisApp` cmake target. The preset
 # puts the binary at bin/build/<preset>/example/IrisApp inside the IRIS

@@ -24,6 +24,11 @@ from harness.schema import NormalizedResult
 
 TOOL = "apple_vfr"
 
+# Apple VFR is currently always UNSUPPORTED; declare a single profile so
+# the runner doesn't iterate.
+SUPPORTED_PROFILES = ["WCAG2.2-SC2.3.1"]
+PROFILE_AFFECTS_BEHAVIOR = False
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MATLAB_SRC = (
     REPO_ROOT / "corpus" / "sources" / "VideoFlashingReduction" /

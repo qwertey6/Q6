@@ -265,16 +265,32 @@ def _load_manifest(manifest_csv: Path) -> dict[str, dict]:
     return out
 
 
-def _load_results(results_dir: Path, adapter: str) -> dict[str, dict]:
-    """fixture_id -> normalized result dict for one adapter."""
+def _load_results(results_dir: Path, adapter: str, profile: str) -> dict[str, dict]:
+    """fixture_id -> normalized result dict for one (adapter, profile)."""
     out: dict[str, dict] = {}
-    per_adapter = results_dir / "results" / adapter
-    if not per_adapter.exists():
+    per_profile = results_dir / "results" / adapter / profile
+    if not per_profile.exists():
         return out
-    for p in per_adapter.glob("*.json"):
+    for p in per_profile.glob("*.json"):
         with p.open() as fh:
             r = json.load(fh)
             out[r["fixture_id"]] = r
+    return out
+
+
+def _discover_adapter_profiles(results_dir: Path) -> list[tuple[str, str]]:
+    """Walk results/ directory and return [(adapter, profile), ...] pairs
+    that have at least one result file."""
+    base = results_dir / "results"
+    if not base.exists():
+        return []
+    out: list[tuple[str, str]] = []
+    for adapter_dir in sorted(base.iterdir()):
+        if not adapter_dir.is_dir():
+            continue
+        for profile_dir in sorted(adapter_dir.iterdir()):
+            if profile_dir.is_dir() and any(profile_dir.glob("*.json")):
+                out.append((adapter_dir.name, profile_dir.name))
     return out
 
 
@@ -293,20 +309,25 @@ def _bucket_to_dict(b: Bucket) -> dict:
 
 
 def score_all(results_dir: Path, manifest_csv: Path) -> dict:
+    """Score every (adapter, profile) combo.
+
+    Each (adapter, profile) is treated as its own scorable entity, keyed
+    under ``per_tool[f"{adapter}@{profile}"]``. The per-fixture label
+    chosen is the one matching the profile's standard slug (see
+    ``_label_for_tool``).
+    """
     manifest = _load_manifest(manifest_csv)
-    discovered_adapters = [d.name for d in (results_dir / "results").iterdir()
-                            if d.is_dir()] if (results_dir / "results").exists() else []
+    pairs = _discover_adapter_profiles(results_dir)
     per_tool: dict[str, dict] = {}
-    for adapter in discovered_adapters:
-        results = _load_results(results_dir, adapter)
-        # Outer join: a fixture without a result for this adapter just doesn't
-        # contribute to that tool's buckets (rare given runner persists everything).
+    for adapter, profile in pairs:
+        results = _load_results(results_dir, adapter, profile)
         rows_with_results = []
         for fixture_id, manifest_row in manifest.items():
             if fixture_id in results:
                 rows_with_results.append((manifest_row, results[fixture_id]))
         buckets = _aggregate(rows_with_results)
-        per_tool[adapter] = {k: _bucket_to_dict(v) for k, v in buckets.items()}
+        key = f"{adapter}@{profile}"
+        per_tool[key] = {k: _bucket_to_dict(v) for k, v in buckets.items()}
     return {
         "tools": list(per_tool),
         "per_tool": per_tool,

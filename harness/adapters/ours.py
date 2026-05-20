@@ -17,6 +17,20 @@ from harness.schema import NormalizedResult, PER_FRAME_CSV_HEADER
 TOOL = "ours"
 TOOL_VERSION = "0.2.0"   # detector v2: region-aware area + pattern detection
 
+# Profiles this adapter supports for multi-profile harness runs. Our
+# detector reads each as a Profile object from detector.PROFILES and
+# actually changes its thresholds accordingly, so PROFILE_AFFECTS_BEHAVIOR
+# is True -- the runner will invoke run() once per profile per fixture.
+SUPPORTED_PROFILES = [
+    "WCAG2.2-SC2.3.1",
+    "WCAG2.2-classic",
+    "ITU-R-BT.1702",
+    "Ofcom-GN2-Annex1",
+    "Trace24",
+    "NAB-J",
+]
+PROFILE_AFFECTS_BEHAVIOR = True
+
 
 def run(fixture_path: Path, profile: str = "WCAG2.2-SC2.3.1",
         per_frame_out: Path | None = None) -> dict:

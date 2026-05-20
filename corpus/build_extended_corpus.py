@@ -147,6 +147,14 @@ def _alternating_full_screen(path: Path, fps: int, hz: float,
 MANIFEST_COLUMNS = [
     "source", "license", "type", "path",
     "expected_label", "expected_detail_file",
+    # Per-standard expected-label columns added in build_manifest.py;
+    # OURS-extended fixtures don't carry per-fixture per-standard labels
+    # (they derive PASS/FAIL analytically from their generation_params
+    # against a single standard) so these are emitted empty -- scoring
+    # falls back to expected_label keyed against each standard the
+    # standard_clause names.
+    "expected_trace24", "expected_wcag2_2", "expected_ofcom2017",
+    "expected_itu_r1702_4", "expected_iso9241_391",
     "standard_clause", "frame_rate", "color_space", "dynamic_range",
     "resolution", "codec", "generation_params",
     "provenance_commit", "notes",
@@ -174,6 +182,9 @@ class Row:
             str(self.path.relative_to(CORPUS_DIR.parent)),
             self.expected_label,
             "",  # no separate detail file; generation_params is the proof
+            # Per-standard label columns: empty for OURS-extended (scoring
+            # falls back to expected_label via standard_clause matching).
+            "", "", "", "", "",
             self.standard_clause,
             str(self.frame_rate),
             self.color_space,

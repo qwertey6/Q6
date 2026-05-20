@@ -31,6 +31,17 @@ from harness.schema import NormalizedResult
 
 TOOL = "ffmpeg_photosensitivity"
 
+# vf_photosensitivity has no standards-aware profile (it's a single
+# heuristic mitigation filter). We declare profiles only so its single
+# verdict gets cross-checked against each standard's labels.
+SUPPORTED_PROFILES = [
+    "WCAG2.2-SC2.3.1",
+    "Trace24",
+    "ITU-R-BT.1702",
+    "Ofcom-GN2-Annex1",
+]
+PROFILE_AFFECTS_BEHAVIOR = False
+
 
 def _ffmpeg_version() -> str:
     try:
