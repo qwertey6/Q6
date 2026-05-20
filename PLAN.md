@@ -27,7 +27,7 @@ Four pillars, each developed behind a hard interface so they can be audited inde
    - `electronicarts/IRIS-Unreal-Plugin` — clone for provenance only; documented as **excluded** (not headless-runnable).
 2. Record every commit hash + retrieval date in `corpus/PROVENANCE.md`. Preserve each LICENSE in place.
 3. Build `corpus/MANIFEST.csv` per the schema in §2.2 of the brief. Every label cites a clause. No vote-derived labels.
-4. **Fresh search pass** (web search) for newer open-source PSE detectors (Flikcer, Carreira et al., Alzubaidi/Otoom/Al-Tamimi, Chiquet & Ochs, TRACE D2, browser extensions). For each: add adapter if open-source + runnable + headless; else add a row to the "known but excluded" table with reason.
+4. **Fresh search pass** (web search) for newer open-source PSE detectors (Flikcer, Kaya et al. 2025 / `samfatu/pse-detection-correction`, Alzubaidi/Otoom/Al-Tamimi, Chiquet & Ochs, TRACE D2, browser extensions). For each: add adapter if open-source + runnable + headless; else add a row to the "known but excluded" table with reason.
 5. Materialize TRACE videos via `corpus/build_trace_videos.sh` using *pinned* deps recorded in `environment.lock`. Codec/library version differences flip near-threshold cases — determinism is non-negotiable here.
 6. Extend the corpus (`source = "OURS-extended"`) with:
    - Frame rates {24, 25, 30, 50, 60, 90, 120}.

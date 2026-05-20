@@ -417,15 +417,11 @@ def excluded_tool_rows() -> Iterable[Row]:
          "https://flikcerapp.com/",
          "Web app only; no published open-source library entry point.",
          ""),
-        ("samfatu/pse-detection-correction",
-         "NONE (no LICENSE file in upstream repo)",
-         "https://github.com/samfatu/pse-detection-correction",
-         "No LICENSE in repo; default = all rights reserved. Excluded pending license clarification.",
-         ""),
-        ("Carreira et al. 2025 PSE detection/correction",
-         "TBD (paper only)",
-         "https://link.springer.com/article/10.1007/s11760-025-04608-4",
-         "Paper published; no public reference implementation linked.",
+        ("Kaya, Kilic, Genc & Kural 2025 (SIViP) — impl: samfatu/pse-detection-correction",
+         "implementation repo did not include a LICENSE file at probe date",
+         "https://link.springer.com/article/10.1007/s11760-025-04608-4 (impl: https://github.com/samfatu/pse-detection-correction)",
+         "Included pending license clarification from the authors; adapter and "
+         "inclusion are ready once the implementation repository carries a redistributable license.",
          ""),
     ]
     for name, lic, url, reason, commit in excluded:

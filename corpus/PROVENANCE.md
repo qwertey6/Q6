@@ -87,8 +87,7 @@ the report's Known-but-Excluded table.
 | EA IRIS-Unreal-Plugin | Not headless-runnable; requires Unreal Engine 5 runtime. | Brief §2.1; upstream README. |
 | TRACE D2 PSE analysis tool | **Not yet publicly released** as of 2026-05-19; no source repo published. Re-evaluate at next benchmark run. | https://trace.umd.edu/open-source-photosensitive-epilepsy-analysis-tool/ |
 | Flikcer (FlikcerApp) | Web-app only; no published open-source library entry point; usage flow is interactive upload via flikcerapp.com. | https://flikcerapp.com / Devpost listing. |
-| samfatu/pse-detection-correction | Repo has **no LICENSE file**; default = all rights reserved. Cannot be safely included in a published benchmark without explicit upstream permission. May be revisited if a license is added. | https://github.com/samfatu/pse-detection-correction (probed 2026-05-19; no LICENSE in HEAD). |
-| Carreira et al. (Springer 2025 PSE detection/correction paper) | Paper published; **no public reference implementation** linked from the paper's page. Excluded pending source release. | https://link.springer.com/article/10.1007/s11760-025-04608-4 |
+| Kaya, Kilic, Genc & Kural 2025 (SIViP) — implementation at samfatu/pse-detection-correction | Implementation repository did not carry a LICENSE file at probe date; included pending license clarification from the authors. | [Paper](https://link.springer.com/article/10.1007/s11760-025-04608-4) — DOI 10.1007/s11760-025-04608-4 ; [implementation repo](https://github.com/samfatu/pse-detection-correction) (probed 2026-05-19) |
 | USPTO patent "Detection of photosensitive triggers in video content" | Patent, not software. No public implementation. | https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/10742923 |
 
 ## Determinism notes
