@@ -206,6 +206,41 @@ def _saturated_red(bgr_uint8: np.ndarray) -> np.ndarray:
 # The 1-second windowed count of transitions at a pixel divided by 2 is
 # that pixel's flash rate.
 
+def _regional_delta(delta: np.ndarray,
+                    intensity_threshold: float,
+                    active_threshold_frac: float,
+                    min_region_area_px: int) -> np.ndarray:
+    """Replace per-pixel ``delta`` with the mean delta of each pixel's
+    connected component in the active mask (|delta| > frac × threshold).
+
+    Pixels not in any significant component keep their original delta.
+    The effect: all pixels in a uniformly-flashing region see the same
+    ΔL each frame, so they fire (or don't) together. This addresses the
+    codec-noise fragmentation issue where a uniform real-world flash
+    region produces inconsistent per-pixel ΔL values that cause the
+    downstream area test to under-count.
+
+    Operates on signed delta (preserves sign of the region's net move).
+    """
+    active = np.abs(delta) > intensity_threshold * active_threshold_frac
+    if not active.any():
+        return delta
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        active.astype(np.uint8), connectivity=8
+    )
+    if n_labels <= 1:
+        return delta
+    out = delta.copy()
+    for li in range(1, n_labels):
+        area = int(stats[li, cv2.CC_STAT_AREA])
+        if area < min_region_area_px:
+            continue
+        region_mask = labels == li
+        region_mean = float(delta[region_mask].mean())
+        out[region_mask] = region_mean
+    return out
+
+
 def _update_transitions(acc: np.ndarray,
                         delta: np.ndarray,
                         threshold: float) -> np.ndarray:
@@ -370,9 +405,36 @@ def analyze(video_path: Path, profile: str = "WCAG2.2-SC2.3.1") -> Result:
     n_pixels = max(1, width * height)
     window_frames = max(1, int(round(p.sliding_window_seconds * fps)))
 
+    # Region-level ΔL aggregation. Real-world mp4v / H.264 codec noise
+    # introduces small per-pixel residuals across an otherwise uniformly-
+    # flashing region; those residuals cause individual pixels to fire one
+    # frame early or late, and the (windowed_count > 6) mask used by the
+    # area test fragments into components too small to exceed the area
+    # threshold. The fix: identify candidate flash regions per frame via
+    # connected components on the |ΔL| > threshold/4 mask, and within each
+    # region, replace each pixel's ΔL with the region's mean ΔL. Pixels in
+    # the same region then fire (or don't) together, giving a clean hazard
+    # mask that the area test can read correctly. This is conceptually the
+    # same operation Dr. Jordan's reference chart for f002f038 uses: one
+    # luminance value per frame, derived from the region's pixels.
+    _region_min_area_px = 100   # ignore tiny components; pixel grit, not regions
+    _active_threshold_frac = 0.25  # |ΔL| > this * intensity_threshold ⇒ "active"
+
     # Per-pixel accumulators (float32 saves memory).
     lum_acc = np.zeros((height, width), dtype=np.float32)
     red_acc = np.zeros((height, width), dtype=np.float32)
+
+    # Per-pixel anchor luminance: the L value at the last accumulator
+    # reset. The WCAG darker-bound exception is about the darker endpoint
+    # of the FLASH PAIR (baseline vs peak), not the darker of two
+    # consecutive frames. Tracking the anchor lets us compare L_current
+    # against L_at_last_reset rather than L_prev. For burst pattern
+    # 222→235→248→222 (relative L 0.72→0.82→0.92→0.72), the relevant
+    # pair for the up-half is (0.72, 0.92) -- min 0.72 < 0.8, counted --
+    # not (0.82, 0.92) which would be incorrectly dropped.
+    L_anchor = np.zeros((height, width), dtype=np.float32)
+    R_anchor = np.zeros((height, width), dtype=np.float32)
+    _anchor_initialized = False
 
     # Previous-frame maps (for diffs).
     prev_L: Optional[np.ndarray] = None
@@ -404,6 +466,9 @@ def analyze(video_path: Path, profile: str = "WCAG2.2-SC2.3.1") -> Result:
         if prev_L is None:
             prev_L = L
             prev_R = R
+            L_anchor = L.copy()
+            R_anchor = R.astype(np.float32).copy()
+            _anchor_initialized = True
             per_frame.append(PerFrame(frame=frame_idx, timestamp=timestamp,
                                        lum_transitions=0, red_transitions=0,
                                        flash_area=0.0))
@@ -412,26 +477,53 @@ def analyze(video_path: Path, profile: str = "WCAG2.2-SC2.3.1") -> Result:
         lum_delta = L - prev_L                                # signed, in luminance units
         red_delta = R.astype(np.float32) - prev_R.astype(np.float32)  # signed, in [-255, 255]
 
-        # Update accumulators and find pixels that fired a transition this frame.
-        lum_fired = _update_transitions(lum_acc, lum_delta,
-                                         p.general_flash_luminance_delta)
-        red_fired = _update_transitions(red_acc, red_delta, float(p.red_sat_delta))
+        # Region-level ΔL: replace each pixel's ΔL with its connected
+        # component's mean ΔL (where the component is identified on the
+        # |ΔL| > frac × threshold mask). See block comment above analyze()'s
+        # _region_min_area_px constant for the rationale (Jordan
+        # correspondence 2026-05-20).
+        lum_delta = _regional_delta(
+            lum_delta, p.general_flash_luminance_delta,
+            _active_threshold_frac, _region_min_area_px,
+        )
+        red_delta = _regional_delta(
+            red_delta, float(p.red_sat_delta),
+            _active_threshold_frac, _region_min_area_px,
+        )
 
-        # WCAG "darker image must be < 0.8" exception: at fired pixels,
-        # the *darker* endpoint of the pair-of-opposing-changes must be
-        # < 0.8 for the flash to count. We approximate: a fired pixel
-        # counts only if min(L, prev_L) at that pixel < darker_bound.
+        # Luminance accumulator + gates. Important sequencing: we must
+        # only reset the accumulator for pixels that actually fire
+        # (passed darker_ok), not for every pixel whose accumulator
+        # crossed threshold. Otherwise codec smearing across a 2-frame
+        # transition (peak → mid → baseline) causes the threshold
+        # crossing at the mid frame to reset the accumulator and discard
+        # the residual that would have completed the transition at the
+        # baseline frame.
+        lum_acc += lum_delta
+        lum_crossed = (lum_acc >= p.general_flash_luminance_delta) | \
+                      (lum_acc <= -p.general_flash_luminance_delta)
         if p.general_flash_darker_bound < 1.0:
-            darker_ok = np.minimum(L, prev_L) < p.general_flash_darker_bound
-            lum_fired &= darker_ok
+            darker_ok = np.minimum(L, L_anchor) < p.general_flash_darker_bound
+            lum_fired = lum_crossed & darker_ok
+        else:
+            lum_fired = lum_crossed
+        lum_acc[lum_fired] = 0.0
+        L_anchor[lum_fired] = L[lum_fired]
 
-        # Red flash: also require the larger of the two saturated-red values
-        # to be ≥ RED_SAT_MIN (Harding minimum). Otherwise the "transition"
-        # is between two near-zero saturated-red values and isn't a red flash.
+        # Red accumulator + gates. Symmetric structure.
+        red_acc += red_delta
+        red_crossed = (red_acc >= float(p.red_sat_delta)) | \
+                      (red_acc <= -float(p.red_sat_delta))
         if p.red_sat_min > 0:
-            larger_red = np.maximum(R, prev_R)
+            R_f32 = R.astype(np.float32) if R.dtype != np.float32 else R
+            larger_red = np.maximum(R_f32, R_anchor)
             red_ok = larger_red >= p.red_sat_min
-            red_fired &= red_ok
+            red_fired = red_crossed & red_ok
+        else:
+            red_fired = red_crossed
+        red_acc[red_fired] = 0.0
+        R_f32_for_anchor = R.astype(np.float32) if R.dtype != np.float32 else R
+        R_anchor[red_fired] = R_f32_for_anchor[red_fired]
 
         # Update windowed transitions.
         lum_trans_window.append(lum_fired)

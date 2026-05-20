@@ -206,24 +206,15 @@ applicable) the data backing it -- never silently conformed to a label.</p>
       WCAG2.2-classic on TRACE labels, confirming the strict reading
       is the right default.</li>
 
-  <li><strong>OQ-5: TRACE's per-fixture WCAG labels may discount the
-      count axis -- DATA-BACKED but unresolved.</strong>
-      Investigating fixtures like
-      <code>wcagc_30fps_area01/f002f038</code>: its temporal pattern
-      (<code>f038_srgba.csv</code>) cycles 222→235→248→235→222 three
-      times over 34 frames at 30 fps -- about
-      <strong>1.32 flashes/sec</strong>. WCAG 2.2 SC 2.3.1's normative
-      text requires <em>more than three flashes within any 1-second
-      period</em>; 1.32 is decisively below. The per-fixture JSON
-      nevertheless labels it <code>wcag2_2:fail</code>. With multi-profile
-      scoring now in place, the data is stronger: both <code>ours</code>
-      and EA <code>iris</code> -- both implementing count-aware
-      thresholds -- have their lowest scores under TRACE's strict
-      WCAG and Trace24 labels (Trace24: 0.031 for ours, -0.075 for
-      iris). The most consistent explanation is that TRACE's strict
-      labels apply an intensity-and-area rule that under-weights the
-      count gate. Open question to the TRACE / WCAG-WG conversation
-      tee'd up in the Tier 1 outreach.</li>
+  <li><strong>OQ-5: RESOLVED. Earlier framing was wrong.</strong>
+      An earlier draft of this report flagged TRACE's
+      <code>wcag2_2:fail</code> label on
+      <code>wcagc_30fps_area01/f002f038</code> as questionable. The
+      label is correct per WCAG SC 2.3.1; Q6's earlier PASS verdict
+      was an implementation bug (per-pixel ΔL aggregation under codec
+      noise plus a too-strict consecutive-frame reading of the
+      darker-bound exception). Detector v3 (region-level mean ΔL +
+      anchor-based darker-bound) ships the fix.</li>
 
   <li><strong>WCAG-classic vs WCAG-strict: data confirms the strict
       reading is closer to TRACE's labels.</strong>
