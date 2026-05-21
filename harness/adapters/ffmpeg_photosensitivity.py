@@ -79,7 +79,11 @@ def run(fixture_path: Path, profile: str = "WCAG2.2-SC2.3.1") -> dict:
     t0 = time.perf_counter()
     # bypass=1 means the filter still detects and logs but does not modify
     # output, which avoids generating a real output file we'd discard.
-    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-loglevel", "info",
+    # NB: ffmpeg's `photosensitivity` filter only emits its per-frame
+    # detection diagnostics at `verbose` log level (not `info`). The
+    # message format is `badness: <pre> -> <post> / <thresh> (<pct>% -
+    # OK|EXCEEDED)` per frame; we count EXCEEDED frames.
+    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-loglevel", "verbose",
            "-i", str(fixture_path),
            "-vf", "photosensitivity=bypass=1",
            "-f", "null", "-"]
@@ -105,15 +109,41 @@ def run(fixture_path: Path, profile: str = "WCAG2.2-SC2.3.1") -> dict:
         ).to_dict()
 
     stderr = cp.stderr or ""
-    # The filter prints "Detected at t=<ts> s" style messages.
-    detections = re.findall(r"\bDetected\s+at\s+t=([\d.]+)\s*s", stderr)
-    first_ts = float(detections[0]) if detections else None
-    proxy_verdict = "FAIL" if detections else "PASS"
+    # ffmpeg's vf_photosensitivity emits one line per frame at verbose
+    # log level, e.g.
+    #   "[Parsed_photosensitivity_0 @ 0x...] badness: <pre> -> <post> /
+    #     <thresh> (<pct>% - EXCEEDED|OK)"
+    # CAVEAT: the filter measures generic temporal pixel variation, NOT
+    # any PSE-specific property. On TRACE fixture pairs that differ
+    # ONLY in area (e.g., f002 vs a002 -- same temporal pattern, just
+    # different flash-region sizes), ffmpeg emits IDENTICAL EXCEEDED
+    # counts. So this tool cannot discriminate area-axis hazards by
+    # construction; it can only flag temporal variation density.
+    # We use "fraction of frames EXCEEDED > 0.5" as a proxy verdict and
+    # document the limitation in the report.
+    n_ok = n_exceeded = 0
+    first_exceeded_line_no: int | None = None
+    for ln in stderr.splitlines():
+        if "Parsed_photosensitivity" in ln and "badness:" in ln:
+            if "EXCEEDED" in ln:
+                if first_exceeded_line_no is None:
+                    first_exceeded_line_no = n_ok + n_exceeded
+                n_exceeded += 1
+            elif "OK" in ln:
+                n_ok += 1
+    total = n_ok + n_exceeded
+    exceeded_frac = (n_exceeded / total) if total > 0 else 0.0
+    src_fps_m = re.search(r"(\d+(?:\.\d+)?)\s*fps", stderr)
+    src_fps = float(src_fps_m.group(1)) if src_fps_m else 30.0
+    first_ts = (first_exceeded_line_no / src_fps
+                if first_exceeded_line_no is not None and src_fps > 0
+                else None)
+    proxy_verdict = "FAIL" if exceeded_frac > 0.5 else "PASS"
 
     return NormalizedResult(
         fixture_id=fixture_path.name,
         verdict=proxy_verdict,
-        failed_dimensions=["luminance"] if detections else [],
+        failed_dimensions=["luminance"] if proxy_verdict == "FAIL" else [],
         first_fail_timestamp=first_ts,
         tool=TOOL, tool_version=_VERSION,
         runtime_seconds=time.perf_counter() - t0,
