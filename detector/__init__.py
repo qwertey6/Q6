@@ -11,4 +11,5 @@ Public entry point: ``detector.analyze(video_path, profile) -> Result``.
 from .core import (  # noqa: F401
     analyze, Result, Profile, PROFILES,
     detect_static_pattern_hazard,
+    CV2_CC_BACKEND, TENSOR_CC_BACKEND, CCBackend,
 )
