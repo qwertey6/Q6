@@ -25,3 +25,8 @@ Thumbs.db
 .idea/
 *.swp
 CORRESPONDENCE.md
+
+# Third-party detector model artifacts. We DO NOT redistribute these
+# (their upstream license unknown / not granted); the adapters fetch
+# them locally. See harness/adapters/flicker_filter.py for the source URL.
+/harness/adapters/flicker_filter_data/

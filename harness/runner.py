@@ -35,7 +35,7 @@ from harness.schema import validate
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-ADAPTERS = ("ours", "ffmpeg_photosensitivity", "iris", "apple_vfr")
+ADAPTERS = ("ours", "ffmpeg_photosensitivity", "iris", "apple_vfr", "flicker_filter")
 
 
 def _load_adapter(name: str):
