@@ -145,6 +145,9 @@ class Bucket:
     fixture_count: int = 0
     fn_fixtures: list[str] = field(default_factory=list)
     fp_fixtures: list[str] = field(default_factory=list)
+    # Parallel arrays for AUROC / PR-AUC: (label, score) pairs. Populated
+    # only when the adapter emits a continuous `score` field.
+    score_pairs: list[tuple[int, float]] = field(default_factory=list)
 
     @property
     def recall(self) -> float | None:
@@ -163,9 +166,22 @@ class Bucket:
         return 0.5 * (r + s)
 
     @property
+    def precision(self) -> float | None:
+        d = self.tp + self.fp
+        return (self.tp / d) if d else None
+
+    @property
     def f1(self) -> float | None:
         d = 2 * self.tp + self.fp + self.fn
         return (2 * self.tp / d) if d else None
+
+    @property
+    def f2(self) -> float | None:
+        """F-beta with beta=2. Weights recall 2× over precision -- the
+        right framing for safety-critical detection where missing a real
+        hazard is much costlier than a false alarm."""
+        d = (5 * self.tp) + self.fp + (4 * self.fn)
+        return (5 * self.tp / d) if d else None
 
     @property
     def mcc(self) -> float | None:
@@ -177,6 +193,56 @@ class Bucket:
         )
         if denom_sq <= 0: return None
         return num / math.sqrt(denom_sq)
+
+    @property
+    def auroc(self) -> float | None:
+        """Area under the ROC curve, computed from (label, score) pairs.
+        Returns None if scores aren't available or both classes aren't
+        represented."""
+        if not self.score_pairs:
+            return None
+        pairs = self.score_pairs
+        n_pos = sum(1 for y, _ in pairs if y == 1)
+        n_neg = sum(1 for y, _ in pairs if y == 0)
+        if n_pos == 0 or n_neg == 0:
+            return None
+        # Wilcoxon-Mann-Whitney statistic (handles ties correctly).
+        sorted_by_score = sorted(pairs, key=lambda x: x[1])
+        ranks: dict[int, float] = {}
+        i = 0
+        while i < len(sorted_by_score):
+            j = i
+            while j < len(sorted_by_score) and \
+                  sorted_by_score[j][1] == sorted_by_score[i][1]:
+                j += 1
+            avg_rank = (i + j - 1) / 2.0 + 1.0  # 1-indexed
+            for k in range(i, j):
+                ranks[id(sorted_by_score[k])] = avg_rank
+            i = j
+        sum_ranks_pos = sum(ranks[id(p)] for p in pairs if p[0] == 1)
+        u = sum_ranks_pos - n_pos * (n_pos + 1) / 2.0
+        return u / (n_pos * n_neg)
+
+    @property
+    def pr_auc(self) -> float | None:
+        """Average precision (area under the precision-recall curve)."""
+        if not self.score_pairs:
+            return None
+        n_pos = sum(1 for y, _ in self.score_pairs if y == 1)
+        if n_pos == 0:
+            return None
+        sorted_pairs = sorted(self.score_pairs, key=lambda x: -x[1])
+        tp = fp = 0
+        prev_recall = 0.0
+        ap = 0.0
+        for y, _ in sorted_pairs:
+            if y == 1: tp += 1
+            else:      fp += 1
+            recall = tp / n_pos
+            precision = tp / (tp + fp)
+            ap += precision * (recall - prev_recall)
+            prev_recall = recall
+        return ap
 
 
 def _aggregate(rows_with_results: list[tuple[dict, dict]]) -> dict[str, Bucket]:
@@ -210,6 +276,8 @@ def _aggregate(rows_with_results: list[tuple[dict, dict]]) -> dict[str, Bucket]:
             continue
         # Score against the label.
         category = _confusion(expected, verdict)
+        score = result.get("score")
+        label_int = 1 if expected == "FAIL" else 0
         for key in _bucket_keys(manifest_row):
             b = buckets[key]
             b.fixture_count += 1
@@ -218,6 +286,8 @@ def _aggregate(rows_with_results: list[tuple[dict, dict]]) -> dict[str, Bucket]:
                 b.fn_fixtures.append(result.get("fixture_id", ""))
             elif category == "fp":
                 b.fp_fixtures.append(result.get("fixture_id", ""))
+            if score is not None:
+                b.score_pairs.append((label_int, float(score)))
     return buckets
 
 
@@ -302,8 +372,11 @@ def _bucket_to_dict(b: Bucket) -> dict:
         "error": b.error, "unsupported": b.unsupported,
         "fixture_count": b.fixture_count,
         "recall": b.recall, "specificity": b.specificity,
+        "precision": b.precision,
         "balanced_accuracy": b.balanced_accuracy,
-        "f1": b.f1, "mcc": b.mcc,
+        "f1": b.f1, "f2": b.f2, "mcc": b.mcc,
+        "auroc": b.auroc, "pr_auc": b.pr_auc,
+        "n_scored": len(b.score_pairs),
         "fn_fixtures": b.fn_fixtures, "fp_fixtures": b.fp_fixtures,
     }
 
@@ -355,34 +428,47 @@ def main(argv: list[str]) -> int:
         w = csv.writer(fh)
         w.writerow(["tool", "bucket", "tp", "tn", "fp", "fn",
                      "error", "unsupported", "fixture_count",
-                     "recall", "specificity", "balanced_accuracy", "f1", "mcc"])
+                     "recall", "specificity", "precision",
+                     "balanced_accuracy", "f1", "f2", "mcc",
+                     "auroc", "pr_auc", "n_scored"])
         for tool, buckets in scores["per_tool"].items():
             for bname, b in buckets.items():
                 w.writerow([
                     tool, bname,
                     b["tp"], b["tn"], b["fp"], b["fn"],
                     b["error"], b["unsupported"], b["fixture_count"],
-                    f"{b['recall']:.4f}"   if b["recall"]   is not None else "",
+                    f"{b['recall']:.4f}"      if b["recall"]      is not None else "",
                     f"{b['specificity']:.4f}" if b["specificity"] is not None else "",
+                    f"{b['precision']:.4f}"   if b["precision"]   is not None else "",
                     f"{b['balanced_accuracy']:.4f}" if b["balanced_accuracy"] is not None else "",
                     f"{b['f1']:.4f}" if b["f1"] is not None else "",
+                    f"{b['f2']:.4f}" if b["f2"] is not None else "",
                     f"{b['mcc']:.4f}" if b["mcc"] is not None else "",
+                    f"{b['auroc']:.4f}" if b["auroc"] is not None else "",
+                    f"{b['pr_auc']:.4f}" if b["pr_auc"] is not None else "",
+                    b["n_scored"],
                 ])
     print(f"scoring: wrote {csv_path}")
 
     # Compact human summary on stdout.
     print()
     print("=== LEDE TABLE — upstream peer-reviewed subset ===")
-    print(f"{'tool':28s} {'MCC':>8s} {'recall':>8s} {'spec':>8s} {'FN':>4s} {'FP':>4s} {'unsupp':>7s}")
+    print(f"{'tool':28s} {'MCC':>7s} {'F2':>6s} {'AUROC':>6s} "
+          f"{'recall':>7s} {'prec':>6s} {'spec':>6s} {'FN':>4s} {'FP':>4s}")
     for tool, buckets in scores["per_tool"].items():
         b = buckets.get("source:upstream", {})
         if not b:
             continue
+        auroc = b.get("auroc")
         print(f"{tool:28s} "
-              f"{(b.get('mcc') or 0):>8.3f} "
-              f"{(b.get('recall') or 0):>8.3f} "
-              f"{(b.get('specificity') or 0):>8.3f} "
-              f"{b.get('fn', 0):>4d} {b.get('fp', 0):>4d} {b.get('unsupported', 0):>7d}")
+              f"{(b.get('mcc') or 0):>+7.3f} "
+              f"{(b.get('f2') or 0):>6.3f} "
+              f"{(auroc if auroc is not None else 0):>6.3f}{'' if auroc is not None else '*'} "
+              f"{(b.get('recall') or 0):>7.3f} "
+              f"{(b.get('precision') or 0):>6.3f} "
+              f"{(b.get('specificity') or 0):>6.3f} "
+              f"{b.get('fn', 0):>4d} {b.get('fp', 0):>4d}")
+    print("  (* = AUROC not available; tool emits binary verdicts only)")
     return 0
 
 

@@ -55,7 +55,7 @@ def run(fixture_path: Path, profile: str = "WCAG2.2-SC2.3.1") -> dict:
 
     t0 = time.perf_counter()
     try:
-        verdict, _prob = predict_mlp_verdict(fixture_path, profile=profile)
+        verdict, prob = predict_mlp_verdict(fixture_path, profile=profile)
     except FileNotFoundError as e:
         return NormalizedResult(
             fixture_id=fixture_path.name, verdict="ERROR",
@@ -84,4 +84,5 @@ def run(fixture_path: Path, profile: str = "WCAG2.2-SC2.3.1") -> dict:
         runtime_seconds=time.perf_counter() - t0,
         raw_output_path="",
         standard_profile=profile,
+        score=float(prob),
     ).to_dict()

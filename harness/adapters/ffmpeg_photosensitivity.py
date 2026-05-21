@@ -149,4 +149,5 @@ def run(fixture_path: Path, profile: str = "WCAG2.2-SC2.3.1") -> dict:
         runtime_seconds=time.perf_counter() - t0,
         raw_output_path="",  # we discard the null output
         standard_profile=profile,
+        score=float(exceeded_frac),
     ).to_dict()

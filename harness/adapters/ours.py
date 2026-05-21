@@ -97,4 +97,6 @@ def run(fixture_path: Path, profile: str = "WCAG2.2-SC2.3.1",
         runtime_seconds=time.perf_counter() - t0,
         raw_output_path="",
         standard_profile=result.profile_name,
+        score=result.score,
+        per_axis_scores={name: a.score for name, a in result.per_axis.items()},
     ).to_dict()

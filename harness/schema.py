@@ -77,6 +77,9 @@ NORMALIZED_RESULT_SCHEMA: dict = {
         "runtime_seconds":      {"type": "number", "minimum": 0},
         "raw_output_path":      {"type": "string"},
         "standard_profile":     {"type": "string"},
+        "score":                {"type": ["number", "null"]},
+        "per_axis_scores":      {"type": "object",
+                                   "additionalProperties": {"type": "number"}},
         "unsupported_reason":   {"type": ["string", "null"]},
         "error_message":        {"type": ["string", "null"]},
     },
@@ -117,7 +120,15 @@ PER_FRAME_CSV_HEADER = (
 
 @dataclass
 class NormalizedResult:
-    """Adapter-friendly dataclass that serializes to the canonical JSON shape."""
+    """Adapter-friendly dataclass that serializes to the canonical JSON shape.
+
+    The ``score`` field is the adapter's continuous detection score for
+    this fixture. Adapters that produce one (e.g. our detector's
+    severity-ratio, ours_mlp's predicted probability, flicker_filter's
+    ElasticNet output) should emit it; adapters whose underlying tool
+    only emits PASS/FAIL leave it as None. Scoring uses it for AUROC
+    and PR-AUC computation where available.
+    """
 
     fixture_id: str
     verdict: str                        # one of VERDICTS
@@ -131,6 +142,8 @@ class NormalizedResult:
     standard_profile: str = "WCAG2.2-SC2.3.1"
     unsupported_reason: Optional[str] = None
     error_message: Optional[str] = None
+    score: Optional[float] = None       # continuous detection score
+    per_axis_scores: dict = field(default_factory=dict)  # per-hazard-class scores
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -139,6 +152,10 @@ class NormalizedResult:
             d.pop("unsupported_reason", None)
         if self.verdict != "ERROR":
             d.pop("error_message", None)
+        if self.score is None:
+            d.pop("score", None)
+        if not self.per_axis_scores:
+            d.pop("per_axis_scores", None)
         return d
 
 

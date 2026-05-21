@@ -125,6 +125,112 @@ PROFILES: dict[str, Profile] = {
 
 
 # --- Result types ----------------------------------------------------------
+#
+# The detector emits a multi-resolution structure:
+#
+#   Result                                 fixture-level summary
+#     verdict / score / failed_dimensions  binary + continuous summaries
+#     per_axis: dict[axis_name, PerAxisResult]
+#                                          per-axis verdict, fail intervals,
+#                                          peak values, margins to threshold
+#     per_frame: list[PerFrame]            time-resolved trace
+#       per_frame[t].hazard_regions: list[HazardRegion]
+#                                          spatially-resolved hazards;
+#                                          each region tagged with the
+#                                          classes ("luminance", "red",
+#                                          "pattern") it triggers, with
+#                                          per-class severity, mitigation
+#                                          hints, standards clauses, and
+#                                          a counterfactual (what would
+#                                          need to change for PASS)
+#
+# Backward-compat: all original fields are preserved; new fields default
+# to empty/zero so existing consumers keep working.
+
+# Severity bands derived from the score (peak / threshold ratio).
+# score < 1 means the axis isn't in hazard territory yet.
+SEVERITY_BAND_MARGINAL = "marginal"   # 1.00 <= score < 1.10
+SEVERITY_BAND_CLEAR    = "clear"      # 1.10 <= score < 1.50
+SEVERITY_BAND_SEVERE   = "severe"     # score >= 1.50
+
+# Standards clause references emitted on every HazardRegion. Used by the
+# HTML report to link readers to the normative text.
+_STANDARDS_CLAUSE_REFS = {
+    "WCAG2.2-SC2.3.1": {
+        "standard": "WCAG 2.2",
+        "clause": "Success Criterion 2.3.1 - Three Flashes or Below Threshold",
+        "url": "https://www.w3.org/WAI/WCAG22/Understanding/three-flashes-or-below-threshold",
+        "interpretation_note_id": "OQ-4",   # link to detector/THRESHOLDS.md
+    },
+    "WCAG2.2-classic": {
+        "standard": "WCAG 2.2 (Harding-classic area reading)",
+        "clause": "Success Criterion 2.3.1 - Three Flashes or Below Threshold",
+        "url": "https://www.w3.org/WAI/WCAG22/Understanding/three-flashes-or-below-threshold",
+        "interpretation_note_id": "OQ-4",
+    },
+    "Trace24": {
+        "standard": "Trace24",
+        "clause": "Photosensitive content evaluation guidance",
+        "url": "https://trace.umd.edu/peat/",
+    },
+    "ITU-R-BT.1702": {
+        "standard": "ITU-R BT.1702",
+        "clause": "Guidance for the reduction of photosensitive epileptic seizures caused by television",
+        "url": "https://www.itu.int/rec/R-REC-BT.1702/en",
+    },
+    "Ofcom-GN2-Annex1": {
+        "standard": "Ofcom Guidance Note 2 Annex 1",
+        "clause": "Flashing images and regular patterns",
+        "url": "https://www.ofcom.org.uk/__data/assets/pdf_file/0024/24296/section2.pdf",
+    },
+    "NAB-J": {
+        "standard": "NAB J 'BJP' (Japan broadcasters)",
+        "clause": "Photosensitivity guidelines",
+        "url": "https://j-ba.or.jp/",
+    },
+}
+
+
+def _severity_band(score: float) -> str:
+    if score < 1.10: return SEVERITY_BAND_MARGINAL
+    if score < 1.50: return SEVERITY_BAND_CLEAR
+    return SEVERITY_BAND_SEVERE
+
+
+@dataclass(frozen=True)
+class HazardRegion:
+    """A spatially-coherent hazardous region within a single frame.
+
+    A frame can contain multiple regions; a region can trigger multiple
+    hazard classes simultaneously (e.g. a flashing saturated-red square
+    trips both "luminance" and "red").
+    """
+    bbox: tuple[int, int, int, int]                  # (x0, y0, x1, y1) inclusive
+    area_px: int
+    centroid: tuple[float, float]                    # (cx, cy) in pixels
+    classes: frozenset[str]                           # which hazard axes triggered
+    severity: dict[str, float] = field(default_factory=dict)
+    confidence_band: str = SEVERITY_BAND_MARGINAL
+    mitigation: list[dict] = field(default_factory=list)
+    standards_clauses: list[dict] = field(default_factory=list)
+    counterfactual: dict = field(default_factory=dict)
+    track_id: Optional[int] = None                    # filled by later track step
+
+
+@dataclass
+class PerAxisResult:
+    """Per-axis fixture-level summary derived from the per-frame regions."""
+    name: str                                          # luminance | red | pattern | count
+    verdict: str                                       # PASS | FAIL
+    score: float = 0.0                                 # peak / threshold; >= 1 ⇒ FAIL
+    max_windowed_count: int = 0
+    max_hazard_area_px: int = 0
+    max_hazard_area_frac: float = 0.0
+    first_fail_timestamp: Optional[float] = None
+    last_fail_timestamp: Optional[float] = None
+    fail_intervals: list[tuple[float, float]] = field(default_factory=list)
+    margin_to_threshold: float = 0.0                   # signed; positive = above
+
 
 @dataclass
 class PerFrame:
@@ -134,6 +240,7 @@ class PerFrame:
     red_transitions: int
     flash_area: float
     pattern_risk: float = 0.0
+    hazard_regions: list[HazardRegion] = field(default_factory=list)
 
 
 @dataclass
@@ -147,6 +254,149 @@ class Result:
     width: int = 0
     height: int = 0
     n_frames: int = 0
+    # Enriched fields (default-zeroed for back-compat with older consumers).
+    score: float = 0.0                                 # max over per_axis scores
+    per_axis: dict[str, PerAxisResult] = field(default_factory=dict)
+    standards_evaluated: list[str] = field(default_factory=list)
+    per_standard_verdict: dict[str, str] = field(default_factory=dict)
+
+
+# --- HazardRegion construction helpers -------------------------------------
+#
+# Given the per-class peak values within a region's pixels, build a
+# fully-populated HazardRegion with severity, mitigation, clauses, and
+# counterfactual. Designed so the caller computes the region geometry
+# and per-class peaks once, then passes them here -- this keeps the
+# per-frame loop body focused on numerics.
+
+def _build_mitigation(cls: str, peak: int, limit: int, region_area_px: int,
+                       profile: "Profile") -> dict:
+    """Per-class actionable mitigation hint. Returns a dict ready to
+    embed in HazardRegion.mitigation."""
+    if cls == "luminance":
+        return {
+            "axis": "luminance",
+            "current": int(peak),
+            "limit": int(limit),
+            "unit": "windowed transitions (per 1-sec window)",
+            "suggestion": (
+                f"Reduce flash rate so the per-pixel windowed transition "
+                f"count is at most {limit} (currently {int(peak)})."
+            ),
+            "alternatives": [
+                f"Shrink the hazardous region from {int(region_area_px)} px to "
+                f"< {int(profile.area_pixels_limit)} px (so the area axis no "
+                f"longer triggers).",
+                "Lower the inter-state ΔL below the intensity threshold "
+                f"({profile.general_flash_luminance_delta:.2f}).",
+            ],
+        }
+    if cls == "red":
+        return {
+            "axis": "red",
+            "current": int(peak),
+            "limit": int(limit),
+            "unit": "windowed saturated-red transitions (per 1-sec window)",
+            "suggestion": (
+                f"Reduce red oscillation frequency so the per-pixel windowed "
+                f"transition count is at most {limit} (currently {int(peak)})."
+            ),
+            "alternatives": [
+                "Desaturate the red component to bring the larger of the two "
+                f"endpoints below the Harding minimum ({profile.red_sat_min}).",
+                f"Shrink the hazardous region from {int(region_area_px)} px to "
+                f"< {int(profile.area_pixels_limit)} px.",
+            ],
+        }
+    if cls == "count":
+        return {
+            "axis": "count",
+            "current": int(peak),
+            "limit": int(limit),
+            "unit": "absolute transitions (per 1-sec window)",
+            "suggestion": (
+                "Reduce the absolute count of opposing transitions per "
+                "second below the standard's hard cap."
+            ),
+            "alternatives": [],
+        }
+    return {"axis": cls, "current": int(peak), "limit": int(limit),
+            "suggestion": "Reduce the offending signal below threshold."}
+
+
+def _build_counterfactual(severity: dict, region_area_px: int,
+                           profile: "Profile") -> dict:
+    """What would change for this region to PASS? Returns a dict of
+    `axis -> bool` (would-pass-if-flipped) plus a human-readable list."""
+    out_flags: dict[str, bool] = {}
+    out_edits: list[str] = []
+    for cls, score in severity.items():
+        if score < 1.0:
+            out_flags[f"{cls}_under_threshold"] = True
+            continue
+        out_flags[f"{cls}_under_threshold"] = False
+        if cls == "luminance":
+            limit = 2 * profile.general_flash_max_per_second
+            out_edits.append(
+                f"Reduce {cls} windowed-transition count to <= {limit} "
+                f"(currently ~{int(score * limit)})."
+            )
+        elif cls == "red":
+            limit = 2 * profile.red_flash_max_per_second
+            out_edits.append(
+                f"Reduce {cls} windowed-transition count to <= {limit} "
+                f"(currently ~{int(score * limit)})."
+            )
+    if region_area_px >= profile.area_pixels_limit:
+        out_edits.append(
+            f"OR shrink hazardous region area to < {profile.area_pixels_limit} "
+            f"px (currently {int(region_area_px)} px)."
+        )
+    out_flags["area_under_threshold"] = region_area_px < profile.area_pixels_limit
+    return {"flip_flags": out_flags, "minimal_edits": out_edits}
+
+
+def _make_hazard_region(bbox: tuple[int, int, int, int],
+                          area_px: int,
+                          centroid: tuple[float, float],
+                          per_class_peak: dict[str, int],
+                          profile: "Profile") -> HazardRegion:
+    """Assemble a fully-populated HazardRegion. ``per_class_peak`` maps
+    a hazard class (e.g. "luminance") to the peak windowed-transition
+    count observed within the region's pixels for that axis."""
+    # Compute severity per class (peak / threshold). A class is in the
+    # region's `classes` set iff its severity >= 1.
+    classes: set[str] = set()
+    severity: dict[str, float] = {}
+    mitigation_list: list[dict] = []
+    for cls, peak in per_class_peak.items():
+        if cls == "luminance":
+            limit = 2 * profile.general_flash_max_per_second
+        elif cls == "red":
+            limit = 2 * profile.red_flash_max_per_second
+        elif cls == "count" and profile.absolute_flashes_per_second_cap is not None:
+            limit = 2 * profile.absolute_flashes_per_second_cap
+        else:
+            limit = 0
+        if limit <= 0:
+            continue
+        score = float(peak) / float(limit)
+        severity[cls] = score
+        if score >= 1.0:
+            classes.add(cls)
+            mitigation_list.append(_build_mitigation(cls, peak, limit,
+                                                      area_px, profile))
+    overall_score = max(severity.values()) if severity else 0.0
+    band = _severity_band(overall_score)
+    clauses_dict = _STANDARDS_CLAUSE_REFS.get(profile.name)
+    clauses = [clauses_dict] if clauses_dict is not None else []
+    counterfactual = _build_counterfactual(severity, area_px, profile)
+    return HazardRegion(
+        bbox=bbox, area_px=int(area_px), centroid=centroid,
+        classes=frozenset(classes), severity=severity,
+        confidence_band=band, mitigation=mitigation_list,
+        standards_clauses=clauses, counterfactual=counterfactual,
+    )
 
 
 # --- Per-axis state (mutable; torch supports in-place ops) ----------------
@@ -625,24 +875,75 @@ def analyze(video_path: Path, profile: str = "WCAG2.2-SC2.3.1",
         red_window[write_idx] = red_fired
         write_idx = (write_idx + 1) % window_frames
 
-        # Hazard tests.
+        # Hazard tests + rich region extraction.
         lum_max = int(lum_state.window_counts.max().item())
         red_max = int(red_state.window_counts.max().item())
 
-        if "luminance" not in failed_dims and lum_max > lum_count_thresh:
-            hazard_mask = lum_state.window_counts > lum_count_thresh
-            if cc_backend.region_exceeds_area(
-                    hazard_mask, n_pixels,
-                    p.area_fraction_limit, p.area_pixels_limit):
-                failed_dims.add("luminance")
-                if first_fail_ts is None: first_fail_ts = timestamp
-        if "red" not in failed_dims and red_max > red_count_thresh:
-            hazard_mask = red_state.window_counts > red_count_thresh
-            if cc_backend.region_exceeds_area(
-                    hazard_mask, n_pixels,
-                    p.area_fraction_limit, p.area_pixels_limit):
-                failed_dims.add("red")
-                if first_fail_ts is None: first_fail_ts = timestamp
+        # Per-frame hazard regions: only computed when either axis has at
+        # least one pixel over its count threshold. Cheap early-exit
+        # preserves the streaming-hot-path performance.
+        frame_hazard_regions: list[HazardRegion] = []
+        lum_above = lum_max > lum_count_thresh
+        red_above = red_max > red_count_thresh
+        if lum_above or red_above:
+            # Move masks to numpy for cv2 CC. (Tensor CC backend would do
+            # the same work natively when the upstream MPS ops land.)
+            lum_haz_np = (lum_state.window_counts > lum_count_thresh
+                          ).cpu().numpy() if lum_above else None
+            red_haz_np = (red_state.window_counts > red_count_thresh
+                          ).cpu().numpy() if red_above else None
+            # Build union mask + per-class peaks for spatial-component-wise
+            # extraction.
+            if lum_haz_np is not None and red_haz_np is not None:
+                union_mask = lum_haz_np | red_haz_np
+            elif lum_haz_np is not None:
+                union_mask = lum_haz_np
+            else:
+                union_mask = red_haz_np  # type: ignore[assignment]
+            if union_mask is not None and union_mask.any():
+                lum_counts_np = lum_state.window_counts.cpu().numpy()
+                red_counts_np = red_state.window_counts.cpu().numpy()
+                n_labels, labels, stats, centroids = (
+                    cv2.connectedComponentsWithStats(
+                        union_mask.astype(np.uint8), connectivity=8))
+                for li in range(1, n_labels):
+                    area = int(stats[li, cv2.CC_STAT_AREA])
+                    if area < int(p.area_pixels_limit * 0.05):  # 5% of limit; debounce noise
+                        continue
+                    x0 = int(stats[li, cv2.CC_STAT_LEFT])
+                    y0 = int(stats[li, cv2.CC_STAT_TOP])
+                    w_box = int(stats[li, cv2.CC_STAT_WIDTH])
+                    h_box = int(stats[li, cv2.CC_STAT_HEIGHT])
+                    region_mask = (labels == li)
+                    per_class_peak: dict[str, int] = {}
+                    if lum_haz_np is not None:
+                        per_class_peak["luminance"] = int(
+                            lum_counts_np[region_mask].max())
+                    if red_haz_np is not None:
+                        per_class_peak["red"] = int(
+                            red_counts_np[region_mask].max())
+                    if abs_cap is not None:
+                        per_class_peak["count"] = max(
+                            per_class_peak.get("luminance", 0),
+                            per_class_peak.get("red", 0))
+                    region = _make_hazard_region(
+                        bbox=(x0, y0, x0 + w_box, y0 + h_box),
+                        area_px=area,
+                        centroid=(float(centroids[li][0]),
+                                   float(centroids[li][1])),
+                        per_class_peak=per_class_peak,
+                        profile=p,
+                    )
+                    if region.classes:  # at least one axis triggered
+                        frame_hazard_regions.append(region)
+
+        # Aggregate per-frame regions into the fixture-level failed_dims.
+        for region in frame_hazard_regions:
+            for cls in region.classes:
+                if region.area_px > p.area_pixels_limit or \
+                   (region.area_px / n_pixels) > p.area_fraction_limit:
+                    failed_dims.add(cls)
+                    if first_fail_ts is None: first_fail_ts = timestamp
         if abs_cap is not None and "count" not in failed_dims:
             if lum_max > abs_cap or red_max > abs_cap:
                 failed_dims.add("count")
@@ -654,10 +955,16 @@ def analyze(video_path: Path, profile: str = "WCAG2.2-SC2.3.1",
             red_transitions=red_max,
             flash_area=float(max(lum_fired.sum().item(),
                                   red_fired.sum().item())) / n_pixels,
+            hazard_regions=frame_hazard_regions,
         ))
         prev_L, prev_R = L, R
 
     cap.release()
+
+    # Build per-axis fixture-level aggregates from the per-frame regions.
+    per_axis = _aggregate_per_axis(per_frame, p, n_pixels, failed_dims)
+    fixture_score = max((a.score for a in per_axis.values()), default=0.0)
+
     return Result(
         verdict="FAIL" if failed_dims else "PASS",
         failed_dimensions=sorted(failed_dims),
@@ -668,7 +975,82 @@ def analyze(video_path: Path, profile: str = "WCAG2.2-SC2.3.1",
         width=width,
         height=height,
         n_frames=frame_idx,
+        score=fixture_score,
+        per_axis=per_axis,
+        standards_evaluated=[p.name],
+        per_standard_verdict={p.name: ("FAIL" if failed_dims else "PASS")},
     )
+
+
+def _aggregate_per_axis(per_frame: list[PerFrame], profile: "Profile",
+                          n_pixels: int,
+                          failed_dims: set[str]) -> dict[str, PerAxisResult]:
+    """Walk the per-frame hazard regions and build a PerAxisResult for
+    each hazard class that appears. ``verdict`` reflects the COMBINED
+    (count + area + intensity) per-axis outcome from ``failed_dims``;
+    ``score`` is the per-axis count-severity (peak windowed count over
+    the count threshold) which can be >= 1 even when verdict is PASS
+    (e.g. count crossed but the hazardous region was too small to meet
+    the area limit -- diagnostically useful)."""
+    axes_seen: set[str] = set()
+    for f in per_frame:
+        for region in f.hazard_regions:
+            axes_seen.update(region.classes)
+
+    out: dict[str, PerAxisResult] = {}
+    for axis in sorted(axes_seen):
+        if axis == "luminance":
+            count_limit = 2 * profile.general_flash_max_per_second
+        elif axis == "red":
+            count_limit = 2 * profile.red_flash_max_per_second
+        elif axis == "count" and profile.absolute_flashes_per_second_cap is not None:
+            count_limit = 2 * profile.absolute_flashes_per_second_cap
+        else:
+            count_limit = 0
+        max_count = 0
+        max_area = 0
+        first_ts: Optional[float] = None
+        last_ts: Optional[float] = None
+        intervals: list[tuple[float, float]] = []
+        in_fail = False
+        interval_start: Optional[float] = None
+        for f in per_frame:
+            this_frame_has = False
+            for region in f.hazard_regions:
+                if axis not in region.classes:
+                    continue
+                this_frame_has = True
+                # Region's peak for this axis is severity * count_limit.
+                region_peak = int(round(region.severity.get(axis, 0.0)
+                                         * count_limit))
+                max_count = max(max_count, region_peak)
+                max_area = max(max_area, region.area_px)
+                if first_ts is None: first_ts = f.timestamp
+                last_ts = f.timestamp
+            if this_frame_has and not in_fail:
+                interval_start = f.timestamp
+                in_fail = True
+            elif not this_frame_has and in_fail:
+                intervals.append((interval_start or 0.0, f.timestamp))
+                in_fail = False
+                interval_start = None
+        if in_fail and interval_start is not None:
+            intervals.append((interval_start, per_frame[-1].timestamp
+                              if per_frame else interval_start))
+        score = (float(max_count) / float(count_limit)) if count_limit > 0 else 0.0
+        out[axis] = PerAxisResult(
+            name=axis,
+            verdict="FAIL" if axis in failed_dims else "PASS",
+            score=score,
+            max_windowed_count=max_count,
+            max_hazard_area_px=max_area,
+            max_hazard_area_frac=float(max_area) / max(n_pixels, 1),
+            first_fail_timestamp=first_ts,
+            last_fail_timestamp=last_ts,
+            fail_intervals=intervals,
+            margin_to_threshold=float(max_count - count_limit) if count_limit > 0 else 0.0,
+        )
+    return out
 
 
 # --- CLI -------------------------------------------------------------------
