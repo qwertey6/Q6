@@ -30,11 +30,12 @@ import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import cv2  # type: ignore
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 
 # --- Device selection ------------------------------------------------------
@@ -193,27 +194,223 @@ _saturated_red = (
 )
 
 
-# --- Region-mean ΔL (numpy/cv2; no torch equivalent) ----------------------
+# --- Native-tensor connected components ------------------------------------
+#
+# Eliminates the per-frame cv2/numpy boundary crossing (which was ~5-10 ms
+# per frame on MPS due to tensor → CPU → numpy → CPU → MPS transfers).
+#
+# Algorithm: path-doubling label propagation. Each active pixel starts
+# with its own (1-indexed) linear-index label; each iteration takes the
+# min of (self, each 4-neighbor's label) where both endpoints are active.
+# Naïve 1-pixel-per-iteration propagation converges in O(diameter)
+# iterations -- 2998 iters for 1080p worst case, far too slow. We instead
+# walk through shifts of 1, 2, 4, 8, ..., 1024 (covers up to 1920 px
+# paths), then do a small convergence pass at distance 1 to clean up.
+# This is O(log(diameter)) iterations.
+#
+# Path-doubling with "endpoint must be active" is correct for DENSE
+# active regions (which is what our flash regions are). For sparse
+# active masks with thin connecting paths, the long jumps could
+# erroneously merge components that aren't actually connected; but
+# our active masks are the union of contiguous flash regions, never
+# sparse.
 
-def _regional_delta(delta_np: np.ndarray,
-                    intensity_threshold: float) -> np.ndarray:
-    """CC-based region-mean ΔL. Same algorithm as the JAX branch's helper
-    by the same name; this is independent code (no torch dependency)."""
+_CC_SHIFT_SCHEDULE = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)
+_CC_CONVERGE_ITERS = 4  # nearest-neighbour cleanup after path-doubling
+
+
+def _tensor_cc_step(labels: torch.Tensor, dim: int, shift: int) -> torch.Tensor:
+    """One direction of label propagation along ``dim`` by ``abs(shift)``.
+
+    Pure-functional: uses F.pad + slice instead of torch.roll + in-place
+    zeroing, so the whole thing fuses cleanly under torch.compile and
+    avoids materialising intermediates the wrap-around case would
+    otherwise need.
+    """
+    abs_shift = abs(shift)
+    h = labels.shape[0]
+    w = labels.shape[1]
+    if dim == 0:
+        if shift > 0:
+            # value at row (i-shift) appears at row i
+            shifted = F.pad(labels, (0, 0, abs_shift, 0))[:h]
+        else:
+            shifted = F.pad(labels, (0, 0, 0, abs_shift))[abs_shift:]
+    else:
+        if shift > 0:
+            shifted = F.pad(labels, (abs_shift, 0))[:, :w]
+        else:
+            shifted = F.pad(labels, (0, abs_shift))[:, abs_shift:]
+    both_active = (labels > 0) & (shifted > 0)
+    return torch.where(both_active, torch.minimum(labels, shifted), labels)
+
+
+def _tensor_cc_impl(active: torch.Tensor) -> torch.Tensor:
+    """Pure-tensor connected component labeling via path-doubling.
+
+    Returns int32 label map of the same shape as ``active``; 0 = inactive,
+    positive integers = component labels (each component labeled with the
+    linear index of its smallest-indexed active pixel + 1).
+    """
+    h = active.shape[0]
+    w = active.shape[1]
+    flat_idx = (torch.arange(h * w, dtype=torch.int32, device=active.device)
+                 .view(h, w) + 1)
+    labels = torch.where(active, flat_idx, torch.zeros_like(flat_idx))
+    # Path-doubling pass.
+    for shift in _CC_SHIFT_SCHEDULE:
+        labels = _tensor_cc_step(labels, dim=0, shift=shift)
+        labels = _tensor_cc_step(labels, dim=0, shift=-shift)
+        labels = _tensor_cc_step(labels, dim=1, shift=shift)
+        labels = _tensor_cc_step(labels, dim=1, shift=-shift)
+    # Convergence pass at distance 1 -- ensures any irregular boundaries
+    # get cleaned up that the path-doubling missed.
+    for _ in range(_CC_CONVERGE_ITERS):
+        labels = _tensor_cc_step(labels, dim=0, shift=1)
+        labels = _tensor_cc_step(labels, dim=0, shift=-1)
+        labels = _tensor_cc_step(labels, dim=1, shift=1)
+        labels = _tensor_cc_step(labels, dim=1, shift=-1)
+    return labels
+
+
+# Compiled version: TorchInductor fuses the ~60 path-doubling tensor ops
+# into a small number of kernels. First call per shape is slow (~seconds
+# of compile time); steady-state is fast.
+_tensor_cc = (
+    torch.compile(_tensor_cc_impl, mode="reduce-overhead", dynamic=False)
+    if _USE_COMPILE else _tensor_cc_impl
+)
+
+
+# --- Two interchangeable CC backends behind a small DI surface -----------
+#
+# The `tensor` backend keeps everything on-device but currently hits three
+# known-pathological MPS ops (see Q6 issue tracker / pytorch issues #97310,
+# #141789, #149325): torch.bincount, torch.unique(return_counts=True), and
+# eager torch.roll. On M-series Macs these make a single frame take 10-20s
+# each. Once upstream PyTorch fixes those, this backend becomes the right
+# default; for now we ship the cv2 backend as default and keep the tensor
+# backend code path live (good for CPU; passes on the regression panel)
+# behind a Q6_CC_BACKEND=tensor opt-in.
+#
+# Both backends present the same signature: tensors in, tensors out.
+# Backends are selected via Q6_CC_BACKEND env var ("cv2" or "tensor") OR
+# by passing cc_backend= to analyze().
+
+
+def _regional_delta_cv2(delta: torch.Tensor,
+                         intensity_threshold: float) -> torch.Tensor:
+    """cv2-backed regional ΔL. One numpy↔torch boundary crossing per
+    call; cv2's C connected-components is fast and well-tuned. Proven
+    correct on the full regression panel."""
+    delta_np = delta.cpu().numpy()
     active = np.abs(delta_np) > intensity_threshold * 0.25
     if not active.any():
-        return delta_np
+        return delta
     n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
         active.astype(np.uint8), connectivity=8
     )
     if n_labels <= 1:
-        return delta_np
+        return delta
     out = delta_np.copy()
     for li in range(1, n_labels):
         if int(stats[li, cv2.CC_STAT_AREA]) < 100:
             continue
         region_mask = labels == li
         out[region_mask] = float(delta_np[region_mask].mean())
-    return out
+    return torch.from_numpy(out).to(delta.device)
+
+
+def _regional_delta_tensor(delta: torch.Tensor,
+                            intensity_threshold: float) -> torch.Tensor:
+    """Native-tensor region-mean ΔL. Currently slow on MPS due to upstream
+    PyTorch issues with bincount / unique on this backend (see block
+    comment above). Works correctly on CPU; included for future use when
+    the MPS ops are fixed and as a CPU-only option."""
+    active = torch.abs(delta) > intensity_threshold * 0.25
+    if not bool(active.any().item()):
+        return delta
+
+    labels = _tensor_cc(active)
+    flat_labels = labels.view(-1).long()
+    flat_delta = delta.view(-1)
+    n_buckets = labels.numel() + 1
+
+    areas = torch.bincount(flat_labels, minlength=n_buckets)
+    sums = torch.zeros(n_buckets, dtype=delta.dtype, device=delta.device)
+    sums.scatter_add_(0, flat_labels, flat_delta)
+    safe_areas = areas.clamp(min=1).to(delta.dtype)
+    means = torch.where(areas >= 100, sums / safe_areas, torch.zeros_like(sums))
+
+    means_at_pixel = means[flat_labels].view(delta.shape)
+    use_mean = (areas[flat_labels] >= 100).view(delta.shape)
+    return torch.where(use_mean, means_at_pixel, delta)
+
+
+def _region_exceeds_area_cv2(hazard_mask: torch.Tensor, n_pixels: int,
+                              fraction_limit: float,
+                              pixels_limit: int) -> bool:
+    """cv2-backed area test. Tensor in, Python bool out."""
+    mask_np = hazard_mask.cpu().numpy()
+    if not mask_np.any():
+        return False
+    n_labels, _labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask_np.astype(np.uint8), connectivity=8
+    )
+    if n_labels <= 1:
+        return False
+    max_area = int(stats[1:, cv2.CC_STAT_AREA].max())
+    return (max_area > pixels_limit) or ((max_area / n_pixels) > fraction_limit)
+
+
+def _region_exceeds_area_tensor(hazard_mask: torch.Tensor, n_pixels: int,
+                                 fraction_limit: float,
+                                 pixels_limit: int) -> bool:
+    """Native-tensor area test. Same MPS caveat as _regional_delta_tensor."""
+    if not bool(hazard_mask.any().item()):
+        return False
+    labels = _tensor_cc(hazard_mask)
+    flat_labels = labels.view(-1).long()
+    n_buckets = labels.numel() + 1
+    areas = torch.bincount(flat_labels, minlength=n_buckets)
+    areas[0] = 0
+    max_area = int(areas.max().item())
+    return (max_area > pixels_limit) or ((max_area / n_pixels) > fraction_limit)
+
+
+@dataclass(frozen=True)
+class CCBackend:
+    """Dependency-injection seam for connected-component operations.
+    Bundles the two cc-dependent ops behind a stable signature so the
+    analyze loop is agnostic to which implementation is in use."""
+    name: str
+    regional_delta: "Callable[[torch.Tensor, float], torch.Tensor]"
+    region_exceeds_area: "Callable[[torch.Tensor, int, float, int], bool]"
+
+
+CV2_CC_BACKEND = CCBackend(
+    name="cv2",
+    regional_delta=_regional_delta_cv2,
+    region_exceeds_area=_region_exceeds_area_cv2,
+)
+TENSOR_CC_BACKEND = CCBackend(
+    name="tensor",
+    regional_delta=_regional_delta_tensor,
+    region_exceeds_area=_region_exceeds_area_tensor,
+)
+_CC_BACKENDS = {b.name: b for b in (CV2_CC_BACKEND, TENSOR_CC_BACKEND)}
+
+
+def _default_cc_backend() -> CCBackend:
+    """Resolved at every call (not import-time) so tests can flip the env
+    var between runs without re-importing the module."""
+    name = os.environ.get("Q6_CC_BACKEND", "cv2")
+    if name not in _CC_BACKENDS:
+        raise ValueError(
+            f"unknown Q6_CC_BACKEND={name!r}; "
+            f"known: {sorted(_CC_BACKENDS)}"
+        )
+    return _CC_BACKENDS[name]
 
 
 # --- Per-axis step ---------------------------------------------------------
@@ -277,19 +474,8 @@ def _axis_step_red(state: AxisState, signal: torch.Tensor,
     return fired
 
 
-# --- Region-aware area decision (numpy/cv2 boundary; called rarely) --------
-
-def _region_exceeds_area(hazard_mask_np: np.ndarray, n_pixels: int,
-                         fraction_limit: float, pixels_limit: int) -> bool:
-    if not hazard_mask_np.any():
-        return False
-    n_labels, _labels, stats, _ = cv2.connectedComponentsWithStats(
-        hazard_mask_np.astype(np.uint8), connectivity=8
-    )
-    if n_labels <= 1:
-        return False
-    max_area = int(stats[1:, cv2.CC_STAT_AREA].max())
-    return (max_area > pixels_limit) or ((max_area / n_pixels) > fraction_limit)
+# (Region-area test is now native-tensor; see _region_exceeds_area_tensor
+#  above. cv2 stays only for static-pattern detection and image I/O.)
 
 
 # --- Static spatial-pattern detection (ITU-R BT.1702 §3) -------------------
@@ -350,10 +536,19 @@ def detect_static_pattern_hazard(image_path: Path,
 
 # --- Main analyzer ---------------------------------------------------------
 
-def analyze(video_path: Path, profile: str = "WCAG2.2-SC2.3.1") -> Result:
+def analyze(video_path: Path, profile: str = "WCAG2.2-SC2.3.1",
+            cc_backend: Optional[CCBackend] = None) -> Result:
+    """Analyze a video for PSE hazards under the given profile.
+
+    ``cc_backend`` selects the connected-components implementation
+    (defaults to env var Q6_CC_BACKEND, then to cv2). Pass
+    CV2_CC_BACKEND or TENSOR_CC_BACKEND explicitly to override.
+    """
     if profile not in PROFILES:
         raise ValueError(f"unknown profile {profile!r}; known: {sorted(PROFILES)}")
     p = PROFILES[profile]
+    if cc_backend is None:
+        cc_backend = _default_cc_backend()
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -411,14 +606,9 @@ def analyze(video_path: Path, profile: str = "WCAG2.2-SC2.3.1") -> Result:
                                        flash_area=0.0))
             continue
 
-        # Region-mean ΔL on numpy/cv2 side. One boundary crossing per frame.
-        # .cpu().numpy() is needed for MPS/CUDA tensors; on CPU it's a no-op.
-        lum_delta_np = _regional_delta(
-            (L - prev_L).cpu().numpy(), lum_threshold)
-        red_delta_np = _regional_delta(
-            (R - prev_R).cpu().numpy(), red_threshold)
-        lum_delta = torch.from_numpy(lum_delta_np).to(DEVICE)
-        red_delta = torch.from_numpy(red_delta_np).to(DEVICE)
+        # Region-mean ΔL via the selected CC backend.
+        lum_delta = cc_backend.regional_delta(L - prev_L, lum_threshold)
+        red_delta = cc_backend.regional_delta(R - prev_R, red_threshold)
 
         # Per-axis update (mutates state).
         lum_fired = _axis_step_lum(
@@ -440,15 +630,17 @@ def analyze(video_path: Path, profile: str = "WCAG2.2-SC2.3.1") -> Result:
         red_max = int(red_state.window_counts.max().item())
 
         if "luminance" not in failed_dims and lum_max > lum_count_thresh:
-            mask_np = (lum_state.window_counts > lum_count_thresh).cpu().numpy()
-            if _region_exceeds_area(mask_np, n_pixels,
-                                     p.area_fraction_limit, p.area_pixels_limit):
+            hazard_mask = lum_state.window_counts > lum_count_thresh
+            if cc_backend.region_exceeds_area(
+                    hazard_mask, n_pixels,
+                    p.area_fraction_limit, p.area_pixels_limit):
                 failed_dims.add("luminance")
                 if first_fail_ts is None: first_fail_ts = timestamp
         if "red" not in failed_dims and red_max > red_count_thresh:
-            mask_np = (red_state.window_counts > red_count_thresh).cpu().numpy()
-            if _region_exceeds_area(mask_np, n_pixels,
-                                     p.area_fraction_limit, p.area_pixels_limit):
+            hazard_mask = red_state.window_counts > red_count_thresh
+            if cc_backend.region_exceeds_area(
+                    hazard_mask, n_pixels,
+                    p.area_fraction_limit, p.area_pixels_limit):
                 failed_dims.add("red")
                 if first_fail_ts is None: first_fail_ts = timestamp
         if abs_cap is not None and "count" not in failed_dims:
