@@ -143,11 +143,15 @@ def render_heatmap(result: Any, out_path: Path) -> Path:
         intervals = info.get("fail_intervals", []) or []
         peak_sev = float(info.get("score", 0.0))
         class_failed = cls in failed_dims
-        lane_color = CLASS_COLORS.get(cls, "#888")
         chip_color = FAIL_COLOR if class_failed else PASS_COLOR
         chip_text = f"{cls.upper()}: {'FAIL' if class_failed else 'PASS'}"
+        # Lane background colour mirrors the verdict: light green for
+        # PASS, light pink for FAIL. The contrast at the lane divider
+        # makes a failing lane visually distinct at any zoom/pan level
+        # without depending on the viewer reading the chip first.
+        lane_bg_color = FAIL_COLOR if class_failed else PASS_COLOR
 
-        ax_head.axhspan(y - 0.45, y + 0.45, color=lane_color, alpha=0.07)
+        ax_head.axhspan(y - 0.45, y + 0.45, color=lane_bg_color, alpha=0.10)
         ax_head.text(0.05, y + 0.18, chip_text,
                       va="center", ha="left",
                       fontsize=10.5, fontweight="bold", color="white",
@@ -174,8 +178,10 @@ def render_heatmap(result: Any, out_path: Path) -> Path:
         y = n_lanes - 1 - ai
         info = per_axis.get(cls, {})
         intervals = info.get("fail_intervals", []) or []
+        class_failed = cls in failed_dims
         lane_color = CLASS_COLORS.get(cls, "#888")
-        ax_body.axhspan(y - 0.45, y + 0.45, color=lane_color, alpha=0.07)
+        lane_bg_color = FAIL_COLOR if class_failed else PASS_COLOR
+        ax_body.axhspan(y - 0.45, y + 0.45, color=lane_bg_color, alpha=0.10)
         sev_series = severity[cls]
         for start, end in intervals:
             width = max(end - start, min_bar_width)
