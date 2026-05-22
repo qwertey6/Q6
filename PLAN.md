@@ -1,4 +1,35 @@
-# PLAN.md — PSE Detector + Conformance Benchmark Harness
+# PLAN.md — Q6 architecture + status
+
+> This document combines the original architecture plan (M0–M4 below)
+> with current implementation status. For the day-to-day "what is Q6
+> and how do I run it" front door, read [`README.md`](README.md) first.
+
+## Status as of last update
+
+  - **M0 (foundation)** — done. Repo layout, schema, Makefile, Dockerfile
+    skeleton all in place; CI runs the detector self-test + pytest panel
+    on every push.
+  - **M1 (corpus)** — done. 306 TRACE fixtures + 45 Q6-extended fixtures
+    materialized. MANIFEST.csv has per-standard label columns for all
+    seven supported standards (NAB-J labels derived analytically — see
+    `corpus/derive_per_standard_labels.py`).
+  - **M2 (harness)** — done. Six adapters wired (Q6 classical + Q6 MLP,
+    IRIS, FFmpeg vf_photosensitivity, Apple VFR, flickerfilter), runner
+    enforces label isolation in code, scoring emits MCC + F2 + AUROC +
+    PR-AUC + precision/recall/specificity per (tool, profile, bucket).
+  - **M3 (Q6 detector)** — done for the classical path. Algorithm
+    implements WCAG-strict thresholds with seven profile variants,
+    each cited clause-by-clause in `detector/THRESHOLDS.md`. Native-
+    tensor CC backend exists but is currently gated on upstream
+    PyTorch MPS fixes (see `detector/ml/SANITY_CHECKS.md`).
+  - **M4 (report)** — done for the comparative LEDE; per-fixture HTML
+    report + spatial-temporal heatmap shipped. The full single-page
+    comparison report (M4 originally scoped) is the next natural
+    deliverable.
+  - **ML layer (post-M4 addition)** — A1–A6 experiment sweep complete;
+    A6 stacking + K-fold-on-TRACE produces MCC +0.355, the
+    best ML result on this corpus. Documented in
+    `detector/ml/EXPERIMENTS.md` and `detector/ml/SANITY_CHECKS.md`.
 
 ## Architecture summary
 
@@ -77,48 +108,38 @@ Four pillars, each developed behind a hard interface so they can be audited inde
 
 ## Open / deferred items
 
-- **`cmake` is not installed locally** — needed to build EA IRIS from source. Resolution: handled in Dockerfile; local IRIS build is best-effort and Docker is the authoritative path.
-- **ISO 9241-391** referenced by number only; text not fetched/vendored (non-free). The report's limitations section names this explicitly.
-- **Apple VFR MATLAB reference runtime** — if MATLAB is not available in CI, try GNU Octave compatibility; if neither works headless, the Apple tool is marked UNSUPPORTED with a documented reason rather than faked.
-- **IRIS-Unreal-Plugin** — runtime requires Unreal Engine; excluded from automated scoring with documented reason in the report's known-but-excluded table.
-- **Fresh competitive landscape search** — performed during M1; results table populated then.
+- **External validation.** All current ground-truth comes from TRACE's
+  corpus (labels), Q6-extended (analytic labels from generation params),
+  or derived from those (NAB-J via `derive_per_standard_labels.py`).
+  Real cross-source validation requires running Q6 against an external
+  corpus we don't author — e.g., NHK / J-BA / Akatsuki / Imagica EMS
+  internal datasets, BBC / EBU samples, fresh academic shares. Outreach
+  is in flight; see `CORRESPONDENCE.md` (gitignored locally).
+- **MPS tensor CC backend.** Native-tensor CC works correctly on CPU but
+  is 100-1000× slower than cv2 on MPS due to three upstream PyTorch
+  perf issues (`bincount`, `unique(return_counts)`, `roll`). Pending
+  upstream fixes (separate PRs in flight). The cv2 backend is the
+  default and is fast enough; the tensor backend is opt-in via
+  `Q6_CC_BACKEND=tensor`.
+- **Ship the report.** The comparative single-page HTML report from
+  M4's original scope (LEDE table + methodology + per-tool gap
+  analysis) hasn't been produced as one artifact yet, even though all
+  the underlying data + per-fixture reports + heatmaps are in place.
+- **Q6-extended labels at the area boundary.** OQ-2 in
+  `detector/THRESHOLDS.md` — at `area_exactly_25pct`, the detector
+  reads "more than 25%" literally and returns PASS, but the generator
+  labels FAIL. Surface as an open question in the comparative report;
+  the generator's label is the one that's wrong.
 
-## Deviations from the brief
+## Resolved items (kept for historical context)
 
-* **Per-standard fixture ground truth discovered late.** Every TRACE fixture
-  JSON carries an `expected_result` block with per-standard PASS/FAIL
-  (`trace24`, `wcag2_2`, `ofcom2017`, `itu_r1702_4`, `iso`). The brief
-  describes ground truth via per-set CSVs, which we use; but the JSONs
-  carry strictly richer information. The current manifest collapses per
-  fixture using the per-set CSV (most-conservative applicable-standard
-  verdict). Wiring the JSON `expected_result` through the manifest and
-  scoring is the natural next step and would mechanically resolve OQ-4
-  (the WCAG-classic area-threshold question) by letting each fixture be
-  scored against each applicable standard's specific label rather than
-  one collapsed label.
-
-* **Local-environment limits on external adapters.**
-  * **EA IRIS (C++):** building IRIS requires `cmake` + `vcpkg`, which
-    are not installed locally. The IRIS adapter is implemented and
-    reports `UNSUPPORTED` with a documented reason when the binary is
-    absent. The Dockerfile installs the build chain; the Docker path is
-    authoritative.
-  * **Apple VFR (MATLAB):** MATLAB is non-free. The adapter attempts
-    GNU Octave (installed in Docker) as a best-effort substitute but
-    reports `UNSUPPORTED` until compatibility is verified. Per the
-    brief: no faking.
-
-* **Corpus partially materialized in this session.** TRACE provides 306
-  fixtures across 15 sets. In this session we materialized 5 sets (~92
-  videos: `30fps_alternating_01`, `broadcast_30fps_01`,
-  `wcagc_30fps_area01..03`) to demonstrate the end-to-end pipeline.
-  The full 306 are reproducible from `corpus/build_trace_videos.sh`;
-  the Makefile + Dockerfile build all 15.
-
-* **Q6-extended labels diverge from detector on `area_exactly_25pct`.**
-  This is OQ-2 in `detector/THRESHOLDS.md` (the at-limit question). Our
-  detector reads "more than 25%" literally and returns PASS for the
-  at-limit case; our extended-corpus generator labels it FAIL. Surface
-  in the report as an open question. The generator's label is the one
-  that's wrong; left as-is rather than retuning silently to make the
-  metric look better.
+- **Per-standard fixture ground truth.** OQ-5: TRACE's per-fixture
+  JSONs carry an `expected_result` block with per-standard PASS/FAIL.
+  We now route each tool's verdict to the matching per-standard label
+  column via `harness/scoring.py::PROFILE_TO_STANDARD_SLUG`.
+- **EA IRIS local build.** Verified via native macOS build (Docker
+  blocked on libtool macros). IRIS adapter parses `result.json` from
+  IrisApp's per-fixture tempdir.
+- **Corpus materialization.** All 306 TRACE fixtures + 45 Q6-extended
+  fixtures materialized; `make corpus` rebuilds from sources at pinned
+  commits.
