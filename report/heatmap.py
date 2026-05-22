@@ -1,24 +1,32 @@
-"""Spatial-temporal hazard heatmap.
+"""Q6's canonical hazard visualization: per-class swimlanes.
 
-Renders a PNG where the x-axis is time and the y-axis is a coarse
-spatial grid (default 3x3 → 9 buckets, listed top-to-bottom,
-left-to-right). Each cell's colour is the peak hazard severity in that
-spatial bucket within a small time window.
+For each fixture, draw one horizontal lane per hazard class
+(luminance / red / count / pattern). Each lane has:
 
-**Why this matters for PSE-safe rendering:** a naïve plot with one
-column per video frame reproduces the source's flicker frequency in
-the visualization itself -- a heatmap of a 31 Hz hazardous video
-becomes a 31 Hz stripe pattern, which is the same hazard we're trying
-to warn about. To prevent that, we aggregate frames into wider time
-buckets (default 200 ms, well below 5 Hz) using max-pool, so the
-semantic "this region was hazardous at this time" is preserved without
-inheriting the source's flicker. A subtitle on every rendered chart
-documents the smoothing window so readers know it's intentional.
+  * a left header strip with the class name, a colored PASS/FAIL chip,
+    and a one-line summary (peak severity, number of fail intervals)
+  * a right body with the fail intervals drawn as continuous bars on
+    a shared time axis
 
-Bucket order in the y-axis (top→bottom):
-  0: top-left      1: top-center     2: top-right
-  3: middle-left   4: middle-center  5: middle-right
-  6: bottom-left   7: bottom-center  8: bottom-right
+Why this shape:
+
+  - PSE-safe by construction. Bars are continuous spans (cannot
+    flicker), lane backgrounds are muted tints (no high-contrast
+    adjacencies), no fine repeating patterns.
+  - "Detect if there's an error" is unambiguous. The colored verdict
+    chip + lightly-tinted lane background make a FAIL visually loud
+    even when the underlying data is one frame wide.
+  - "When temporally are the risks" is the x-axis directly.
+  - Class differentiation via lane position + color so a viewer never
+    confuses one class for another.
+  - Severity encoded inside the bar via fill darkness while bar height
+    stays uniform, so a fixture with one severe FAIL and a fixture
+    with one marginal FAIL look visually distinguishable.
+
+The module previously contained a 3x3 spatial × time heatmap; the
+function name ``render_heatmap`` is preserved so external callers
+(``report/fixture_report.py``, anything that imports from this module)
+keep working.
 """
 
 from __future__ import annotations
@@ -28,22 +36,23 @@ from pathlib import Path
 from typing import Any
 
 
-GRID_SIZE = 3  # 3x3 spatial grid
-N_BUCKETS = GRID_SIZE * GRID_SIZE
-_BUCKET_LABELS = [
-    "top-L", "top-C", "top-R",
-    "mid-L", "mid-C", "mid-R",
-    "bot-L", "bot-C", "bot-R",
-]
+# Per-class palette. Muted but distinguishable; no saturated red as a
+# flash element.
+CLASS_COLORS: dict[str, str] = {
+    "luminance": "#c88840",   # warm amber
+    "red":       "#b65c5c",   # desaturated brick
+    "count":     "#7060a0",   # muted purple
+    "pattern":   "#508080",   # muted teal
+}
+PASS_COLOR = "#1a7f3c"
+FAIL_COLOR = "#a8222b"
+SAFE_GRID_COLOR = "#dddddd"
 
-# Width of the temporal max-pool bucket. 200 ms keeps any visible
-# alternation in the rendered chart below 5 Hz (worst case: 2.5 Hz),
-# safely below the 3-flash-per-second WCAG count threshold. Reducing
-# this risks the visualization becoming a PSE hazard itself.
-_DEFAULT_BUCKET_MS = 200
 
+# --- Helpers ---------------------------------------------------------------
 
 def _as_dict(obj: Any) -> Any:
+    """Recursively convert dataclasses/frozenset to plain dict/list."""
     if is_dataclass(obj) and not isinstance(obj, type):
         return _as_dict(asdict(obj))
     if isinstance(obj, dict):
@@ -55,56 +64,50 @@ def _as_dict(obj: Any) -> Any:
     return obj
 
 
-def _bbox_buckets(bbox: tuple[int, int, int, int],
-                    width: int, height: int) -> list[int]:
-    """Return the list of spatial-grid bucket indices that bbox intersects."""
-    x0, y0, x1, y1 = bbox
-    cell_w = width / GRID_SIZE
-    cell_h = height / GRID_SIZE
-    col0 = max(0, min(GRID_SIZE - 1, int(x0 // cell_w)))
-    col1 = max(0, min(GRID_SIZE - 1, int(x1 // cell_w)))
-    row0 = max(0, min(GRID_SIZE - 1, int(y0 // cell_h)))
-    row1 = max(0, min(GRID_SIZE - 1, int(y1 // cell_h)))
-    out: list[int] = []
-    for r in range(row0, row1 + 1):
-        for c in range(col0, col1 + 1):
-            out.append(r * GRID_SIZE + c)
+def _present_classes(result_dict: dict) -> list[str]:
+    """Classes that appear anywhere in the result. Always include
+    luminance + red so a clean-PASS fixture still renders two lanes
+    instead of an empty chart."""
+    seen: set[str] = set()
+    for f in result_dict.get("per_frame", []):
+        for region in f.get("hazard_regions", []):
+            seen.update(region.get("classes", []))
+    seen.update({"luminance", "red"})
+    # Canonical ordering across charts.
+    return [c for c in ("luminance", "red", "pattern", "count") if c in seen]
+
+
+def _per_class_severity_series(result_dict: dict, classes: list[str]):
+    """For each class, per-frame peak severity (0 if not triggered)."""
+    import numpy as np
+    per_frame = result_dict.get("per_frame", [])
+    n_frames = len(per_frame)
+    out = {cls: np.zeros(n_frames, dtype=np.float32) for cls in classes}
+    for fi, f in enumerate(per_frame):
+        for region in f.get("hazard_regions", []):
+            for cls, sev in (region.get("severity") or {}).items():
+                if cls in out and sev > out[cls][fi]:
+                    out[cls][fi] = float(sev)
     return out
 
 
-def _max_pool_time(per_frame_heat, fps: float, bucket_ms: int):
-    """Aggregate per-frame heat (shape: N_BUCKETS x n_frames) into wider
-    time buckets via max-pool. Returns (pooled_heat, bucket_duration_s).
+def _severity_to_alpha(severity: float) -> float:
+    """1.0 (just-FAIL) → 0.45, 2.0+ → 1.0. Keeps a bare-minimum FAIL
+    visible while making severe events visually heavier."""
+    s = max(1.0, float(severity))
+    return min(1.0, 0.45 + 0.45 * (s - 1.0))
 
-    The PSE-safety reason: rendering one column per video frame
-    reproduces the source's flicker frequency in the visualization
-    itself. A 31 Hz hazard video becomes a 31 Hz stripe pattern --
-    the same kind of hazard we're warning about. Pooling to wider
-    time buckets defeats this by guaranteeing visible alternation in
-    the chart stays below ~5 Hz.
+
+# --- Main entry point ------------------------------------------------------
+
+def render_heatmap(result: Any, out_path: Path) -> Path:
+    """Render and save the per-class swimlane chart. Returns ``out_path``.
+
+    Public API preserved for back-compat with the older module shape.
     """
-    import numpy as np
-    if fps <= 0 or per_frame_heat.size == 0:
-        return per_frame_heat, 1.0 / max(fps, 1.0)
-    n_frames = per_frame_heat.shape[1]
-    bucket_dur_s = bucket_ms / 1000.0
-    n_time_buckets = max(1, int(np.ceil(n_frames / (fps * bucket_dur_s))))
-    pooled = np.zeros((per_frame_heat.shape[0], n_time_buckets),
-                       dtype=per_frame_heat.dtype)
-    for fi in range(n_frames):
-        bi = min(int(fi / (fps * bucket_dur_s)), n_time_buckets - 1)
-        np.maximum(pooled[:, bi], per_frame_heat[:, fi], out=pooled[:, bi])
-    return pooled, bucket_dur_s
-
-
-def render_heatmap(result: Any, out_path: Path,
-                     bucket_ms: int = _DEFAULT_BUCKET_MS) -> Path:
-    """Render and save the spatial-temporal heatmap. Returns out_path."""
     r = _as_dict(result)
-    width = r.get("width", 0)
-    height = r.get("height", 0)
     per_frame = r.get("per_frame", [])
-    if not per_frame or width == 0 or height == 0:
+    if not per_frame:
         return _render_empty(out_path)
 
     import numpy as np
@@ -112,57 +115,89 @@ def render_heatmap(result: Any, out_path: Path,
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    n_frames = len(per_frame)
-    per_frame_heat = np.zeros((N_BUCKETS, n_frames), dtype=np.float32)
-    for fi, f in enumerate(per_frame):
-        for region in f.get("hazard_regions", []):
-            bbox = tuple(region.get("bbox", (0, 0, 0, 0)))
-            severity_dict = region.get("severity", {}) or {}
-            peak_sev = max(severity_dict.values(), default=0.0)
-            if peak_sev <= 0:
-                continue
-            for b in _bbox_buckets(bbox, width, height):
-                if peak_sev > per_frame_heat[b, fi]:
-                    per_frame_heat[b, fi] = peak_sev
-
     fps = float(r.get("fps", 0.0)) or 1.0
-    duration = n_frames / fps
+    duration = float(r.get("n_frames", 0)) / max(fps, 0.001)
+    failed_dims = set(r.get("failed_dimensions") or [])
+    overall_verdict = r.get("verdict", "?")
+    classes = _present_classes(r)
+    per_axis = r.get("per_axis") or {}
+    severity = _per_class_severity_series(r, classes)
 
-    # PSE-safe rendering: max-pool to wider time buckets so the chart
-    # itself can't reproduce the source's flicker frequency.
-    heat, bucket_dur_s = _max_pool_time(per_frame_heat, fps, bucket_ms)
-    extent = [0, duration, N_BUCKETS - 0.5, -0.5]
+    n_lanes = len(classes)
+    fig = plt.figure(figsize=(max(11.5, duration * 1.6 + 2.5),
+                                max(2.6, 1.0 * n_lanes + 1.0)))
+    gs = fig.add_gridspec(1, 2, width_ratios=[1.0, 3.2], wspace=0.02)
+    ax_head = fig.add_subplot(gs[0, 0])
+    ax_body = fig.add_subplot(gs[0, 1])
 
-    fig, ax = plt.subplots(figsize=(max(8, duration * 1.5), 4.5))
-    vmax = max(2.0, float(heat.max()) if heat.size else 1.0)
-    # Sequential colormap with no white→bright-red transition; the bold
-    # bicolour cmaps (hot_r in particular) create high-contrast edges
-    # at hazard onset that read as flicker.
-    im = ax.imshow(heat, aspect="auto", extent=extent, origin="upper",
-                    cmap="Reds", vmin=0.0, vmax=vmax, interpolation="nearest")
-    ax.set_yticks(range(N_BUCKETS))
-    ax.set_yticklabels(_BUCKET_LABELS, fontsize=9)
-    ax.set_xlabel("time (s)")
-    ax.set_ylabel("spatial bucket (3x3 grid)")
-    ax.set_title(f"Q6 — {r.get('verdict','?')} — {Path(r.get('profile_name','?')).name} "
-                  f"— score {r.get('score', 0.0):.3f}", fontsize=11)
-    # Footer noting the PSE-safe smoothing.
-    ax.text(0.0, -0.18,
-            f"chart temporally aggregated to {bucket_ms} ms buckets "
-            f"(max-pool) so the visualization itself stays below ~5 Hz "
-            f"and does not reproduce the source's flicker frequency",
-            transform=ax.transAxes, fontsize=8, color="#666",
-            verticalalignment="top")
+    # --- Headers (left column) ---
+    ax_head.set_xlim(0, 1)
+    ax_head.set_ylim(-0.5, n_lanes - 0.5)
+    ax_head.set_xticks([]); ax_head.set_yticks([])
+    for spine in ax_head.spines.values():
+        spine.set_visible(False)
 
-    # Horizontal grid lines between rows of the 3x3 (also de-emphasised
-    # to avoid creating their own visual flicker against the colormap).
-    for y in (2.5, 5.5):
-        ax.axhline(y, color="#bbb", linewidth=0.4, linestyle="--")
+    for ai, cls in enumerate(classes):
+        y = n_lanes - 1 - ai
+        info = per_axis.get(cls, {})
+        intervals = info.get("fail_intervals", []) or []
+        peak_sev = float(info.get("score", 0.0))
+        class_failed = cls in failed_dims
+        lane_color = CLASS_COLORS.get(cls, "#888")
+        chip_color = FAIL_COLOR if class_failed else PASS_COLOR
+        chip_text = f"{cls.upper()}: {'FAIL' if class_failed else 'PASS'}"
 
-    cbar = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
-    cbar.set_label("peak severity (≥1 = FAIL)")
+        ax_head.axhspan(y - 0.45, y + 0.45, color=lane_color, alpha=0.07)
+        ax_head.text(0.05, y + 0.18, chip_text,
+                      va="center", ha="left",
+                      fontsize=10.5, fontweight="bold", color="white",
+                      bbox=dict(facecolor=chip_color, edgecolor="none",
+                                 pad=4, boxstyle="round,pad=0.4"))
+        if class_failed:
+            sub = (f"peak severity {peak_sev:.2f}  •  "
+                   f"{len(intervals)} interval{'s' if len(intervals) != 1 else ''}")
+        else:
+            sub = "no intervals above threshold"
+        ax_head.text(0.05, y - 0.25, sub,
+                      va="center", ha="left", fontsize=8.5, color="#555")
 
-    fig.tight_layout()
+    # --- Lane bodies (right column) ---
+    ax_body.set_xlim(0, max(duration, 0.5))
+    ax_body.set_ylim(-0.5, n_lanes - 0.5)
+    ax_body.set_yticks([])
+    ax_body.set_xlabel("time (s)")
+    ax_body.grid(axis="x", color=SAFE_GRID_COLOR, linewidth=0.5)
+    ax_body.set_axisbelow(True)
+
+    min_bar_width = max(duration * 0.012, 1 / max(fps, 1.0))
+    for ai, cls in enumerate(classes):
+        y = n_lanes - 1 - ai
+        info = per_axis.get(cls, {})
+        intervals = info.get("fail_intervals", []) or []
+        lane_color = CLASS_COLORS.get(cls, "#888")
+        ax_body.axhspan(y - 0.45, y + 0.45, color=lane_color, alpha=0.07)
+        sev_series = severity[cls]
+        for start, end in intervals:
+            width = max(end - start, min_bar_width)
+            i0 = max(0, int(start * fps))
+            i1 = min(len(sev_series), max(i0 + 1, int(end * fps)))
+            peak_in_interval = (float(sev_series[i0:i1].max())
+                                if i1 > i0 else 1.0)
+            alpha = _severity_to_alpha(peak_in_interval)
+            ax_body.barh(y, width, left=start, height=0.55,
+                          color=lane_color, alpha=alpha,
+                          edgecolor=FAIL_COLOR, linewidth=1.0, zorder=3)
+
+    # Strong horizontal lane dividers (swimlane style).
+    for y in range(n_lanes - 1):
+        ax_body.axhline(y + 0.5, color="#aaa", linewidth=1.0)
+        ax_head.axhline(y + 0.5, color="#aaa", linewidth=1.0)
+
+    overall_color = FAIL_COLOR if overall_verdict == "FAIL" else PASS_COLOR
+    fig.suptitle(f"Q6 — per-class hazard swimlanes  "
+                  f"(overall: {overall_verdict}, profile: {r.get('profile_name','?')})",
+                  color=overall_color, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=120, bbox_inches="tight")
     plt.close(fig)
@@ -186,7 +221,8 @@ def _render_empty(out_path: Path) -> Path:
 
 def _main_cli(argv: list[str]) -> int:
     import argparse
-    ap = argparse.ArgumentParser(description="Render spatial-temporal hazard heatmap PNG.")
+    ap = argparse.ArgumentParser(
+        description="Render Q6's per-class swimlane chart.")
     ap.add_argument("video", type=Path, help="Input video.")
     ap.add_argument("--profile", default="WCAG2.2-SC2.3.1")
     ap.add_argument("--out", type=Path, default=None)
@@ -194,7 +230,7 @@ def _main_cli(argv: list[str]) -> int:
     from detector import analyze
     result = analyze(args.video, args.profile)
     out_path = args.out or (Path(__file__).resolve().parents[1] / "report"
-                              / "out" / (args.video.stem + "_heatmap.png"))
+                              / "out" / (args.video.stem + "_swimlanes.png"))
     render_heatmap(result, out_path)
     print(f"wrote {out_path}")
     return 0

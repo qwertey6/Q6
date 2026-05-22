@@ -54,12 +54,18 @@ is hazardous, plus how to fix it:
     confidence band (marginal / clear / severe), structured mitigation
     hints with alternatives, linked standards clauses, and a
     counterfactual ("would PASS if...")
-  - **Spatial-temporal heatmap** — one-glance answer to "where and when":
+  - **Per-class swimlane chart** — one-glance answer to "did this video
+    have hazards, of which class, and when":
 
-    ![heatmap example](docs/assets/heatmap_example.png)
+    ![swimlane example](docs/assets/heatmap_example.png)
 
-    *(60 fps, full-screen 31 Hz flash. Every spatial bucket lights up
-    with periodic vertical bars at the 31 Hz cadence. Red = severity ≥1.)*
+    *(60 fps, full-screen 31 Hz flash. The luminance lane carries a red
+    FAIL chip and twelve interval bars at the burst times; the
+    red-flash lane shows a green PASS chip and stays empty. Lanes are
+    PSE-safe by construction: bars are continuous spans that cannot
+    flicker, severity is encoded inside each bar via fill darkness,
+    and the verdict chip in each lane header makes a single-frame
+    FAIL just as visually loud as a sustained one.)*
 
 A per-fixture HTML report wraps all of the above into one self-contained
 file suitable for content creators / accessibility reviewers.
