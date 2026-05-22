@@ -1,9 +1,9 @@
-"""Train the ours_mlp detector.
+"""Train the q6_mlp detector.
 
-Trains on the OURS-extended subset (45 fixtures) -- the synthetic
+Trains on the Q6-extended subset (45 fixtures) -- the synthetic
 fixtures with ground-truth labels derived from generation parameters.
 Holds out 20% as validation; reports BCE loss + accuracy + MCC; saves
-checkpoint to detector/ml/checkpoints/ours_mlp.pt.
+checkpoint to detector/ml/checkpoints/q6_mlp.pt.
 
 Run from repo root:
     PYTHONPATH=. python3 -m detector.ml.train
@@ -27,7 +27,7 @@ from .model import OursMlp, FeatureNormaliser
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CKPT_DIR = REPO_ROOT / "detector" / "ml" / "checkpoints"
-CKPT_PATH = CKPT_DIR / "ours_mlp.pt"
+CKPT_PATH = CKPT_DIR / "q6_mlp.pt"
 
 
 def mcc(tp: int, fp: int, fn: int, tn: int) -> float:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""corpus/build_extended_corpus.py — generate the OURS-extended fixture set.
+"""corpus/build_extended_corpus.py — generate the Q6-extended fixture set.
 
 Every fixture's label is computed analytically from its generation
 parameters against the *standard* it claims to test, never by running a
@@ -8,7 +8,7 @@ detector says PASS but the parameters analytically violate WCAG SC 2.3.1
 thresholds, the label is FAIL and the report records the disagreement as
 an open question, not as a tuning target.
 
-Sections (each appends rows to MANIFEST.csv with source = "OURS-extended"):
+Sections (each appends rows to MANIFEST.csv with source = "Q6-extended"):
 
   1. FPS sweep        — same logical 3.1Hz / 2.9Hz luminance flash at
                         {24, 25, 30, 50, 60, 90, 120} fps. Above 3Hz/s
@@ -61,7 +61,7 @@ import cv2  # type: ignore
 
 
 CORPUS_DIR = Path(__file__).resolve().parent
-OUT_DIR = CORPUS_DIR / "generated" / "OURS-extended"
+OUT_DIR = CORPUS_DIR / "generated" / "Q6-extended"
 MANIFEST_PATH = CORPUS_DIR / "MANIFEST.csv"
 
 # Reference canvas — matches TRACE's 1920x1080 SDR sRGB convention.
@@ -148,7 +148,7 @@ MANIFEST_COLUMNS = [
     "source", "license", "type", "path",
     "expected_label", "expected_detail_file",
     # Per-standard expected-label columns added in build_manifest.py;
-    # OURS-extended fixtures don't carry per-fixture per-standard labels
+    # Q6-extended fixtures don't carry per-fixture per-standard labels
     # (they derive PASS/FAIL analytically from their generation_params
     # against a single standard) so these are emitted empty -- scoring
     # falls back to expected_label keyed against each standard the
@@ -176,13 +176,13 @@ class Row:
 
     def to_csv_row(self) -> list[str]:
         return [
-            "OURS-extended",
+            "Q6-extended",
             "BSD-3-Clause (this repo)",
             "video",
             str(self.path.relative_to(CORPUS_DIR.parent)),
             self.expected_label,
             "",  # no separate detail file; generation_params is the proof
-            # Per-standard label columns: empty for OURS-extended (scoring
+            # Per-standard label columns: empty for Q6-extended (scoring
             # falls back to expected_label via standard_clause matching).
             "", "", "", "", "",
             self.standard_clause,
@@ -468,7 +468,7 @@ def codec_roundtrip_rows(seed_rows: list[Row]) -> Iterable[Row]:
         ("prores422",  ["-c:v", "prores_ks", "-profile:v", "2"],                 ".mov"),
         ("vp9_crf32",  ["-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0"],        ".webm"),
     ]
-    # Re-encode a subset so the OURS-extended corpus stays a manageable size.
+    # Re-encode a subset so the Q6-extended corpus stays a manageable size.
     seeds = [r for r in seed_rows if "boundary_precision" in str(r.path) or "fps_sweep" in str(r.path)][:4]
     for seed in seeds:
         for enc_name, enc_args, ext in encodes:
@@ -557,7 +557,7 @@ def main() -> None:
         for r in rows:
             w.writerow(r.to_csv_row())
 
-    print(f"OURS-extended: {len(rows)} fixtures written; manifest appended.")
+    print(f"Q6-extended: {len(rows)} fixtures written; manifest appended.")
 
 
 if __name__ == "__main__":

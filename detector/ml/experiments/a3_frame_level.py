@@ -1,4 +1,4 @@
-"""A3: Frame-level training on OURS-extended.
+"""A3: Frame-level training on Q6-extended.
 
 Instead of one (features, label) pair per fixture, derive per-frame
 labels from the generation parameters (which frames are "in a
@@ -15,7 +15,7 @@ properties of how the fixture was generated):
   - area_boundary: same -- whole-video area exceeds threshold or not.
   - false_positive_battery: PASS, all frames non-hazardous.
 
-So for OURS-extended, frame label = fixture label everywhere -- the
+So for Q6-extended, frame label = fixture label everywhere -- the
 generation didn't produce sub-fixture temporal variation.
 
 This means: A3 turns 45 fixtures into ~45 * mean_frames ≈ ~5,000
@@ -23,7 +23,7 @@ training samples, all sharing the fixture label. The MLP can now learn
 per-frame discriminators (windowed_count, flash_area at THIS frame)
 rather than max-aggregated summary stats.
 
-We hold out 20% of OURS-extended fixtures (not frames) for val to
+We hold out 20% of Q6-extended fixtures (not frames) for val to
 avoid label leakage; test on TRACE fixtures aggregated to verdict.
 """
 
@@ -100,19 +100,19 @@ class FrameMlp(nn.Module):
 
 def run(seed: int = 0, val_frac: float = 0.2, epochs: int = 200,
         lr: float = 3e-3, weight_decay: float = 1e-3) -> ExperimentResult:
-    print("A3: per-frame training on OURS-extended")
+    print("A3: per-frame training on Q6-extended")
 
     # Gather per-fixture per-frame features + fixture labels.
     train_pool = []
     for video_path, fid, label in _iter_fixtures(
-            "expected_wcag2_2", sources_in=("OURS-extended",)):
+            "expected_wcag2_2", sources_in=("Q6-extended",)):
         try:
             feats, fps = _extract_per_frame_features(video_path)
         except Exception as e:
             print(f"  skip train {fid}: {e}")
             continue
         train_pool.append((feats, label, fid))
-    print(f"  OURS-extended fixtures: {len(train_pool)}")
+    print(f"  Q6-extended fixtures: {len(train_pool)}")
 
     rng = np.random.default_rng(seed)
     perm = rng.permutation(len(train_pool))
@@ -156,7 +156,7 @@ def run(seed: int = 0, val_frac: float = 0.2, epochs: int = 200,
             probs = torch.sigmoid(model(torch.from_numpy(frames_np))).numpy()
         return int(probs.max() >= 0.5)
 
-    # Val: per OURS-extended held-out fixture
+    # Val: per Q6-extended held-out fixture
     val_y_true = np.array([fp[1] for fp in val_pool])
     val_y_pred = np.array([fixture_verdict(fp[0]) for fp in val_pool])
 

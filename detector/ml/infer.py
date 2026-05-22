@@ -1,4 +1,4 @@
-"""Inference path for the ours_mlp detector.
+"""Inference path for the q6_mlp detector.
 
 Loads the trained model on first call, caches it; exposes
 predict_mlp_verdict(video_path, profile) -> (verdict_str, score).
@@ -17,7 +17,7 @@ from .model import OursMlp, FeatureNormaliser
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-CKPT_PATH = REPO_ROOT / "detector" / "ml" / "checkpoints" / "ours_mlp.pt"
+CKPT_PATH = REPO_ROOT / "detector" / "ml" / "checkpoints" / "q6_mlp.pt"
 DEFAULT_THRESHOLD = 0.5
 
 
@@ -30,7 +30,7 @@ def _load() -> OursMlp:
         return _MODEL
     if not CKPT_PATH.exists():
         raise FileNotFoundError(
-            f"ours_mlp checkpoint missing at {CKPT_PATH}. "
+            f"q6_mlp checkpoint missing at {CKPT_PATH}. "
             f"Run `python3 -m detector.ml.train` first."
         )
     ckpt = torch.load(CKPT_PATH, map_location="cpu", weights_only=False)

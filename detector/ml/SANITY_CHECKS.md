@@ -62,7 +62,7 @@ on known-FAIL fixtures and looked at the result distribution:
 
   - **iris**: tested on `f002f038` (FAIL label, iris -> PASS),
     `f001f037` (FAIL label, iris -> PASS), and a slam-dunk
-    OURS-extended 30 fps_fail_31hz fixture (iris correctly -> FAIL).
+    Q6-extended 30 fps_fail_31hz fixture (iris correctly -> FAIL).
     Iris's low WCAG MCC (-0.037 with recall 0.024) is consistent
     with iris implementing **Harding-classic area thresholds**
     (87,296 px / full 10° ref rectangle) rather than WCAG-strict

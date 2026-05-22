@@ -15,7 +15,7 @@ We slice metrics by:
   * standard (extracted from MANIFEST's standard_clause)
   * dimension (luminance / red / area / count / pattern)
   * frame_rate
-  * source (upstream peer-reviewed vs OURS-extended)
+  * source (upstream peer-reviewed vs Q6-extended)
   * codec
 """
 
@@ -81,7 +81,7 @@ def _per_standard_labels(row: dict) -> dict[str, str]:
         return out
     # Fallback for non-TRACE fixtures: use expected_label as the label
     # for every standard the standard_clause names. This preserves the
-    # pre-OQ-5 behavior on IRIS / Apple / OURS-extended fixtures.
+    # pre-OQ-5 behavior on IRIS / Apple / Q6-extended fixtures.
     fallback = (row.get("expected_label") or "").strip()
     if fallback in ("PASS", "FAIL"):
         clause = (row.get("standard_clause") or "").lower()
@@ -116,8 +116,8 @@ def _label_for_tool(row: dict, result: dict) -> str:
 
 def _source_bucket(row: dict) -> str:
     src = row["source"]
-    if src.startswith("OURS-extended"):
-        return "OURS-extended"
+    if src.startswith("Q6-extended"):
+        return "Q6-extended"
     # Everything else from clone-only upstream goes into the "upstream" bucket
     # that is the lede of the report.
     return "upstream"
@@ -249,7 +249,7 @@ def _aggregate(rows_with_results: list[tuple[dict, dict]]) -> dict[str, Bucket]:
     """Return a dict of bucket-key -> Bucket. Buckets:
 
        overall
-       source:<upstream|OURS-extended>
+       source:<upstream|Q6-extended>
        standard:<name>
        dimension:<name>
        fps:<rate>
@@ -366,6 +366,29 @@ def _discover_adapter_profiles(results_dir: Path) -> list[tuple[str, str]]:
 
 # --- Reporting -------------------------------------------------------------
 
+# Display name mapping. The machine identifier stays as the short
+# adapter slug ("q6", "q6_mlp", "flicker_filter"); the display form
+# is what's shown in tables and graphs so the brand name "Q6" doesn't
+# get lost in screenshots / cropped images.
+_DISPLAY_NAMES = {
+    "q6":                       "Q6 (classical)",
+    "q6_mlp":                   "Q6 (MLP)",
+    "q6_cnn":                   "Q6 (CNN)",
+    "iris":                     "IRIS",
+    "apple_vfr":                "Apple VFR",
+    "ffmpeg_photosensitivity":  "FFmpeg vf_photosensitivity",
+    "flicker_filter":           "flickerfilter",
+}
+
+
+def _display_name(tool_at_profile: str) -> str:
+    """Convert e.g. 'q6@WCAG2.2-SC2.3.1' → 'Q6 (classical) @ WCAG2.2-SC2.3.1'."""
+    if "@" in tool_at_profile:
+        tool, prof = tool_at_profile.split("@", 1)
+        return f"{_DISPLAY_NAMES.get(tool, tool)} @ {prof}"
+    return _DISPLAY_NAMES.get(tool_at_profile, tool_at_profile)
+
+
 def _bucket_to_dict(b: Bucket) -> dict:
     return {
         "tp": b.tp, "tn": b.tn, "fp": b.fp, "fn": b.fn,
@@ -453,14 +476,15 @@ def main(argv: list[str]) -> int:
     # Compact human summary on stdout.
     print()
     print("=== LEDE TABLE — upstream peer-reviewed subset ===")
-    print(f"{'tool':28s} {'MCC':>7s} {'F2':>6s} {'AUROC':>6s} "
+    print(f"{'tool':32s} {'MCC':>7s} {'F2':>6s} {'AUROC':>6s} "
           f"{'recall':>7s} {'prec':>6s} {'spec':>6s} {'FN':>4s} {'FP':>4s}")
     for tool, buckets in scores["per_tool"].items():
         b = buckets.get("source:upstream", {})
         if not b:
             continue
         auroc = b.get("auroc")
-        print(f"{tool:28s} "
+        display = _display_name(tool)
+        print(f"{display:32s} "
               f"{(b.get('mcc') or 0):>+7.3f} "
               f"{(b.get('f2') or 0):>6.3f} "
               f"{(auroc if auroc is not None else 0):>6.3f}{'' if auroc is not None else '*'} "

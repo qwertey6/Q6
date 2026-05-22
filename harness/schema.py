@@ -37,7 +37,7 @@ DIMENSIONS = (
     "area",        # screen-fraction / reference-rectangle area threshold
     "count",       # number of flashes per time window
     "pattern",     # bold static spatial pattern (separate hazard class)
-    "extended",    # OURS-extended axes (high fps, wide gamut, etc.)
+    "extended",    # Q6-extended axes (high fps, wide gamut, etc.)
 )
 
 
@@ -124,7 +124,7 @@ class NormalizedResult:
 
     The ``score`` field is the adapter's continuous detection score for
     this fixture. Adapters that produce one (e.g. our detector's
-    severity-ratio, ours_mlp's predicted probability, flicker_filter's
+    severity-ratio, q6_mlp's predicted probability, flicker_filter's
     ElasticNet output) should emit it; adapters whose underlying tool
     only emits PASS/FAIL leave it as None. Scoring uses it for AUROC
     and PR-AUC computation where available.

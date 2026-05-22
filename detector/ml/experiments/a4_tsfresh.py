@@ -10,7 +10,7 @@ lum_transitions, red_transitions, flash_area. Each fixture gets
 tractable for 45 training samples.
 
 Two evaluation modes:
-  - train on OURS-extended, test on TRACE (apples-to-apples vs A1)
+  - train on Q6-extended, test on TRACE (apples-to-apples vs A1)
   - K-fold CV on TRACE (apples-to-apples vs A2)
 """
 
@@ -79,10 +79,10 @@ def _extract_tsfresh_features(df):
 
 
 def _materialise():
-    """Extract tsfresh features for all OURS-extended + TRACE fixtures."""
+    """Extract tsfresh features for all Q6-extended + TRACE fixtures."""
     print("  extracting per-frame traces and tsfresh features...")
     train_df, train_labels, train_ids = _per_fixture_dataframe(
-        _iter_fixtures("expected_wcag2_2", sources_in=("OURS-extended",))
+        _iter_fixtures("expected_wcag2_2", sources_in=("Q6-extended",))
     )
     test_df, test_labels, test_ids = _per_fixture_dataframe(
         _iter_fixtures("expected_wcag2_2", source_prefix="pse-test-media")
@@ -117,7 +117,7 @@ def run(seed: int = 0) -> list[ExperimentResult]:
         config={"feature_count": X_tr.shape[1], "C": 0.1},
         train_scores=confusion(y_tr, tr_pred),
         test_scores=confusion(y_te, te_pred),
-        notes="train OURS-extended, test TRACE -- vs A1 baselines",
+        notes="train Q6-extended, test TRACE -- vs A1 baselines",
     )
     save_result(r1); print_result(r1); results.append(r1)
 

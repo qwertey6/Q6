@@ -70,7 +70,7 @@ Understanding document.
 
   Passing on any single axis means the whole sequence passes — this is
   the design point that distinguishes a credible detector from a naive
-  one (see PLAN.md §0 and the OURS-extended false-positive battery).
+  one (see PLAN.md §0 and the Q6-extended false-positive battery).
 
 ## Profile: `ITU-R-BT.1702`
 

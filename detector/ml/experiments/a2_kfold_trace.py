@@ -6,7 +6,7 @@ labels (which the classical detector is forbidden from doing, but an
 ML detector can do by design as long as eval uses held-out folds) and
 measures held-out MCC.
 
-If A2 shows high MCC, the features carry signal but the OURS-extended
+If A2 shows high MCC, the features carry signal but the Q6-extended
 training data doesn't. If A2 also fails, the features themselves are
 inadequate and we need A3 / A4.
 

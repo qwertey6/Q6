@@ -99,7 +99,7 @@ def render_heatmap(result: Any, out_path: Path) -> Path:
     ax.set_yticklabels(_BUCKET_LABELS, fontsize=9)
     ax.set_xlabel("time (s)")
     ax.set_ylabel("spatial bucket (3x3 grid)")
-    ax.set_title(f"{r.get('verdict','?')} — {Path(r.get('profile_name','?')).name} "
+    ax.set_title(f"Q6 — {r.get('verdict','?')} — {Path(r.get('profile_name','?')).name} "
                   f"— score {r.get('score', 0.0):.3f}", fontsize=11)
 
     # Horizontal grid lines between rows of the 3x3.

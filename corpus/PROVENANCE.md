@@ -98,5 +98,5 @@ the report's Known-but-Excluded table.
 * TRACE videos are GENERATED from the upstream scripts; they are not
   copied. Therefore `corpus/generated/` is git-ignored and rebuilt by
   `corpus/build_trace_videos.sh`.
-* Generated extended corpus (`source = "OURS-extended"`) is also rebuilt by
+* Generated extended corpus (`source = "Q6-extended"`) is also rebuilt by
   `corpus/build_extended_corpus.py`. Both scripts are seeded.

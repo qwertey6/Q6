@@ -5,9 +5,9 @@ gradient boosting, SVM with RBF, k-NN, naive Bayes). With 45 training
 samples and 313 MLP parameters, the MLP overfit. Simpler classifiers
 with stronger inductive biases may generalize better to TRACE.
 
-Same train/val/test split as ours_mlp:
-  - train: OURS-extended minus 20% val
-  - val:   20% of OURS-extended (random seed 0)
+Same train/val/test split as q6_mlp:
+  - train: Q6-extended minus 20% val
+  - val:   20% of Q6-extended (random seed 0)
   - test:  TRACE pse-test-media fixtures
 
 Eval reports MCC + confusion on each split, persists to JSON.

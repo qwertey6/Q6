@@ -14,7 +14,7 @@ from detector import analyze, detect_static_pattern_hazard
 from harness.schema import NormalizedResult, PER_FRAME_CSV_HEADER
 
 
-TOOL = "ours"
+TOOL = "q6"
 TOOL_VERSION = "0.2.0"   # detector v2: region-aware area + pattern detection
 
 # Profiles this adapter supports for multi-profile harness runs. Our

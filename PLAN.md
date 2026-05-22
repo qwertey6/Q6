@@ -4,7 +4,7 @@
 
 Four pillars, each developed behind a hard interface so they can be audited independently:
 
-1. **Corpus** (`/corpus/`). Read-only set of test fixtures with labeled ground truth, every label traceable to a published standard clause. Upstream sources are cloned at pinned commits into `/corpus/sources/`. TRACE's 306-test set is reproducibly *generated* into `/corpus/generated/` from those pinned generators. We extend the corpus with our own labeled cases (frame-rate sweep, boundary precision, false-positive battery, codec round-trip, color space) under `source = "OURS-extended"` so the report can show upstream-peer-reviewed numbers in isolation.
+1. **Corpus** (`/corpus/`). Read-only set of test fixtures with labeled ground truth, every label traceable to a published standard clause. Upstream sources are cloned at pinned commits into `/corpus/sources/`. TRACE's 306-test set is reproducibly *generated* into `/corpus/generated/` from those pinned generators. We extend the corpus with our own labeled cases (frame-rate sweep, boundary precision, false-positive battery, codec round-trip, color space) under `source = "Q6-extended"` so the report can show upstream-peer-reviewed numbers in isolation.
 
 2. **Harness** (`/harness/`). One normalized result schema. One adapter per tool-under-test. Adapters receive only the fixture path — **never** the label. Scoring runs in a separate process after all adapters finish and joins results to `MANIFEST.csv`. This isolation is the architectural property that makes the benchmark non-gameable; it is the first thing an auditor will check, so it is enforced by file layout, not convention.
 
@@ -29,7 +29,7 @@ Four pillars, each developed behind a hard interface so they can be audited inde
 3. Build `corpus/MANIFEST.csv` per the schema in §2.2 of the brief. Every label cites a clause. No vote-derived labels.
 4. **Fresh search pass** (web search) for newer open-source PSE detectors (Flikcer, Kaya et al. 2025 / `samfatu/pse-detection-correction`, Alzubaidi/Otoom/Al-Tamimi, Chiquet & Ochs, TRACE D2, browser extensions). For each: add adapter if open-source + runnable + headless; else add a row to the "known but excluded" table with reason.
 5. Materialize TRACE videos via `corpus/build_trace_videos.sh` using *pinned* deps recorded in `environment.lock`. Codec/library version differences flip near-threshold cases — determinism is non-negotiable here.
-6. Extend the corpus (`source = "OURS-extended"`) with:
+6. Extend the corpus (`source = "Q6-extended"`) with:
    - Frame rates {24, 25, 30, 50, 60, 90, 120}.
    - Boundary precision: at threshold, ±1 frame, ±1 unit either side.
    - Area at WCAG 341×256 / 25% rectangle: just under, at, just over, multiple positions.
@@ -71,7 +71,7 @@ Four pillars, each developed behind a hard interface so they can be audited inde
 - **Adapter label isolation**: adapter functions take `(fixture_path, profile) -> NormalizedResult`. No `label` parameter exists. Scoring is a separate module.
 - **Determinism**: pinned Python + pinned pip + pinned ffmpeg + pinned IRIS commit + pinned OS image. Seed any randomness. Same checkout → same scores.
 - **Provenance**: every fixture row in MANIFEST cites both upstream provenance (commit hash) and standard clause. No label without a clause.
-- **Separation of upstream vs OURS-extended**: never blended in headline numbers. The report's lede number is the upstream-only score.
+- **Separation of upstream vs Q6-extended**: never blended in headline numbers. The report's lede number is the upstream-only score.
 - **No benchmark-tuning**: when in doubt, the question is "what does the standard say," not "what makes the test pass."
 - **Honesty**: known-but-excluded tools listed with reasons. UNSUPPORTED reported, not hidden. Our own FNs/FPs reported with the same prominence as competitors'.
 
@@ -115,7 +115,7 @@ Four pillars, each developed behind a hard interface so they can be audited inde
   The full 306 are reproducible from `corpus/build_trace_videos.sh`;
   the Makefile + Dockerfile build all 15.
 
-* **OURS-extended labels diverge from detector on `area_exactly_25pct`.**
+* **Q6-extended labels diverge from detector on `area_exactly_25pct`.**
   This is OQ-2 in `detector/THRESHOLDS.md` (the at-limit question). Our
   detector reads "more than 25%" literally and returns PASS for the
   at-limit case; our extended-corpus generator labels it FAIL. Surface

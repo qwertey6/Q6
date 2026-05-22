@@ -206,7 +206,7 @@ def _per_axis_deep_dives(scores: dict) -> str:
             cells.append(f"<td class='num' title='N={n}'>{_fmt(mcc_val)}</td>")
         rows.append("<tr>" + "".join(cells) + "</tr>")
     blocks.append(
-        "<h3>5a. Frame-rate sensitivity (MCC by fps; OURS-extended fps_sweep)</h3>"
+        "<h3>5a. Frame-rate sensitivity (MCC by fps; Q6-extended fps_sweep)</h3>"
         f"<table>{head}{''.join(rows)}</table>"
         "<p class='caption'>Each row uses the adapter's WCAG-profile run. "
         "Empty cells mean no fixtures at that fps in the corpus.</p>"
@@ -214,7 +214,7 @@ def _per_axis_deep_dives(scores: dict) -> str:
 
     # 5b. Codec stability.
     blocks.append(
-        "<h3>5b. Codec stability (OURS-extended codec_roundtrip)</h3>"
+        "<h3>5b. Codec stability (Q6-extended codec_roundtrip)</h3>"
         "<p>The same logical content was re-encoded via H.264 CRF18/CRF28, "
         "ProRes&nbsp;422, VP9. A tool whose verdicts <em>differ</em> across "
         "encodes of identical seed content is unstable on real-world media. "
@@ -268,13 +268,13 @@ def main(argv: list[str]) -> int:
     placeholders = {
         "css":                     args.css.read_text(),
         "per_std_upstream":        _per_standard_table(scores, "upstream"),
-        "per_std_extended":        _per_standard_table(scores, "OURS-extended"),
+        "per_std_extended":        _per_standard_table(scores, "Q6-extended"),
         "upstream_block":          _summary_table(scores, "upstream"),
-        "extended_block":          _summary_table(scores, "OURS-extended"),
+        "extended_block":          _summary_table(scores, "Q6-extended"),
         "missed_hazards_upstream": _list_fixtures(scores, "source:upstream",       "fn_fixtures"),
-        "missed_hazards_extended": _list_fixtures(scores, "source:OURS-extended",  "fn_fixtures"),
+        "missed_hazards_extended": _list_fixtures(scores, "source:Q6-extended",  "fn_fixtures"),
         "false_alarms_upstream":   _list_fixtures(scores, "source:upstream",       "fp_fixtures"),
-        "false_alarms_extended":   _list_fixtures(scores, "source:OURS-extended",  "fp_fixtures"),
+        "false_alarms_extended":   _list_fixtures(scores, "source:Q6-extended",  "fp_fixtures"),
         "excluded":                _known_but_excluded(args.manifest),
         "deep":                    _per_axis_deep_dives(scores),
     }

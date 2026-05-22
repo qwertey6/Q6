@@ -1,4 +1,4 @@
-"""Dataset for the ours_mlp detector.
+"""Dataset for the q6_mlp detector.
 
 Reads MANIFEST.csv, picks fixtures with the requested per-standard label,
 extracts features (with on-disk cache), returns (features, label) pairs.
@@ -7,7 +7,7 @@ Train/test split philosophy (preserves the adapter-label-isolation
 invariant for the *classical* detector that this MLP wraps -- the MLP
 itself is explicitly a learned tool that consumes labels by design):
 
-  - TRAIN set: source == "OURS-extended" (synthetic, ground-truth from
+  - TRAIN set: source == "Q6-extended" (synthetic, ground-truth from
     generation params; the MLP NEVER sees TRACE labels during training)
   - TEST set: source startswith "TRACE/pse-test-media" (held out for
     evaluation by the harness scoring path)
@@ -118,7 +118,7 @@ def load_split(label_column: str = "expected_wcag2_2",
                 np.array(labels, dtype=np.int64),
                 np.array(ids, dtype=object))
 
-    X_tr, y_tr, ids_tr = build({"sources_in": ("OURS-extended",)})
+    X_tr, y_tr, ids_tr = build({"sources_in": ("Q6-extended",)})
     X_te, y_te, ids_te = build({"source_prefix": "pse-test-media"})
     return {
         "X_train": X_tr, "y_train": y_tr, "ids_train": ids_tr,

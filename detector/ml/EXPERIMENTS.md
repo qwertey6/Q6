@@ -22,7 +22,7 @@ TRACE.
 
 ### A1: Different classifiers on the same 10 hand-engineered features
 
-Same dataset split as `ours_mlp` (train OURS-extended, val 20%, test
+Same dataset split as `ours_mlp` (train Q6-extended, val 20%, test
 TRACE). Sweep logistic regression (L1, L2, L2-strong), random forest
 (50, 200 trees), gradient boost, SVM (RBF, linear), kNN, naive Bayes.
 
@@ -36,7 +36,7 @@ TRACE). Sweep logistic regression (L1, L2, L2-strong), random forest
 | gaussian_nb | +1.000 | +0.000 |
 | ours_mlp (313-param MLP) | +1.000 | -0.090 |
 
-**Finding:** every classifier perfectly memorises the 45 OURS-extended
+**Finding:** every classifier perfectly memorises the 45 Q6-extended
 training fixtures (val MCC ≈ 1.0) but transfers near-randomly to
 TRACE. The bottleneck is **distribution mismatch**, not model capacity
 or inductive bias. A1 ceiling on `OURS → TRACE` is roughly +0.07.
@@ -58,14 +58,14 @@ detector; A2 is an upper-bound probe for the ML detector specifically.
 
 **Finding:** the 10-feature space *is* rich enough -- random forest
 beats the classical baseline (+0.309 vs +0.220) when given TRACE
-labels at train time. A1's failure was about the OURS-extended
+labels at train time. A1's failure was about the Q6-extended
 training distribution, not the features themselves.
 
-### A3: Frame-level training on OURS-extended
+### A3: Frame-level training on Q6-extended
 
 Per-fixture training is sample-starved (45 examples). Per-frame
 training inflates this to ~4,239 frames. Frame label = fixture label
-(OURS-extended's generation params don't vary sub-fixture-level);
+(Q6-extended's generation params don't vary sub-fixture-level);
 fixture verdict = max frame probability ≥ 0.5.
 
 | classifier | val MCC | test MCC |
@@ -159,7 +159,7 @@ and that combination wins on MCC.
 
 1. **Features are adequate; training distribution was the bottleneck.**
    A1 → A2 → A6 increasing MCC under the same feature set proves it.
-   The 45 OURS-extended fixtures don't represent the TRACE
+   The 45 Q6-extended fixtures don't represent the TRACE
    distribution well enough to support direct transfer.
 
 2. **Beating classical requires labelled supervision at train time.**

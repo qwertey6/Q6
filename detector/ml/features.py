@@ -1,4 +1,4 @@
-"""Feature extraction for the ours_mlp detector.
+"""Feature extraction for the q6_mlp detector.
 
 Strategy: run the classical Q6 detector to get its per-frame trace, then
 compute summary statistics. The MLP learns to combine the classical

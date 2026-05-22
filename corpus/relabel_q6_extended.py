@@ -1,4 +1,4 @@
-"""Re-derive per-standard labels for OURS-extended fixtures from their
+"""Re-derive per-standard labels for Q6-extended fixtures from their
 generation parameters and category. The original build_extended_corpus.py
 filled `expected_label` (a fallback) but left the per-standard columns
 empty; this script propagates those labels into the per-standard
@@ -62,10 +62,10 @@ STRICT_PER_STANDARD_COLS = (
 
 
 def _category_from_path(p: str) -> str:
-    # corpus/generated/OURS-extended/<category>/<fixture>.mp4
+    # corpus/generated/Q6-extended/<category>/<fixture>.mp4
     parts = p.split("/")
     try:
-        i = parts.index("OURS-extended")
+        i = parts.index("Q6-extended")
         return parts[i + 1]
     except (ValueError, IndexError):
         return ""
@@ -79,7 +79,7 @@ def main() -> int:
 
     n_updated = 0
     for row in rows:
-        if row.get("source") != "OURS-extended":
+        if row.get("source") != "Q6-extended":
             continue
         label = row.get("expected_label", "").strip()
         if label not in ("PASS", "FAIL"):
@@ -90,7 +90,7 @@ def main() -> int:
         elif category in STRICT_ONLY_CATEGORIES:
             cols = STRICT_PER_STANDARD_COLS
         else:
-            print(f"WARN: unknown OURS-extended category {category!r} "
+            print(f"WARN: unknown Q6-extended category {category!r} "
                   f"for {row['path']}; skipping per-standard fill",
                   file=sys.stderr)
             continue
@@ -105,8 +105,8 @@ def main() -> int:
         writer.writerows(rows)
 
     print(f"updated {n_updated} per-standard label cells across "
-          f"{sum(1 for r in rows if r.get('source')=='OURS-extended')} "
-          f"OURS-extended fixtures.")
+          f"{sum(1 for r in rows if r.get('source')=='Q6-extended')} "
+          f"Q6-extended fixtures.")
     return 0
 
 

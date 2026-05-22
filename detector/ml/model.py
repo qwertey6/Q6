@@ -1,4 +1,4 @@
-"""MLP model for the ours_mlp detector.
+"""MLP model for the q6_mlp detector.
 
 Small architecture by design: ~10 input features × tiny hidden layers.
 With only ~45 training fixtures, anything bigger would overfit.

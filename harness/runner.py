@@ -35,8 +35,8 @@ from harness.schema import validate
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-ADAPTERS = ("ours", "ffmpeg_photosensitivity", "iris", "apple_vfr",
-            "flicker_filter", "ours_mlp")
+ADAPTERS = ("q6", "ffmpeg_photosensitivity", "iris", "apple_vfr",
+            "flicker_filter", "q6_mlp")
 
 
 def _load_adapter(name: str):
@@ -118,14 +118,14 @@ def _run_one(adapter_name: str, profiles_to_emit: list[str], fixture_id: str,
     invocation_profile = profiles_to_emit[0]
 
     per_frame = None
-    if adapter_name == "ours":
+    if adapter_name == "q6":
         # Per-frame CSV path embeds the profile so concurrent profile runs
         # don't overwrite each other.
         per_frame = (out_dir / "per_frame" / adapter_name / invocation_profile /
                      (fixture_path.stem + ".csv"))
 
     try:
-        if adapter_name == "ours":
+        if adapter_name == "q6":
             result = adapter.run(fixture_path, profile=invocation_profile,
                                  per_frame_out=per_frame)
         else:
@@ -156,7 +156,7 @@ def main(argv: list[str]) -> int:
                     help="Cap on fixtures (0 = unlimited). Useful for smoke runs.")
     ap.add_argument("--source-filter", default="",
                     help="If set, only run fixtures whose source contains this substring. "
-                         "Used to scope to upstream-only or OURS-extended-only.")
+                         "Used to scope to upstream-only or Q6-extended-only.")
     ap.add_argument("--workers", type=int, default=4,
                     help="Process pool size. Each (adapter, fixture, "
                          "single-or-bulk-profile-group) is one job.")

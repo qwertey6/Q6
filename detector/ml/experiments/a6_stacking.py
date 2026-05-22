@@ -38,7 +38,7 @@ def _load_classical_verdicts(fixture_ids: list[str]) -> dict[str, int]:
     """Load classical detector's verdict for each fixture from the
     saved harness results. Returns id -> {0,1} (0=PASS, 1=FAIL)."""
     import json
-    results_dir = REPO_ROOT / "results" / "results" / "ours" / "WCAG2.2-SC2.3.1"
+    results_dir = REPO_ROOT / "results" / "results" / "q6" / "WCAG2.2-SC2.3.1"
     out = {}
     for fid in fixture_ids:
         safe = fid.replace("/", "__").replace("\\", "__") + ".json"
