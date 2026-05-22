@@ -363,6 +363,22 @@ _SOFTGREY_CMAP = LinearSegmentedColormap.from_list(
     "softgrey", ["#ffffff", "#dddddd", "#888888", "#444444"]
 )
 
+# Per-class palette for Options F, G, H. Muted but distinguishable; no
+# saturated red as a flash element. Each class also has its own
+# white-to-class-color cmap for density panels.
+CLASS_COLORS = {
+    "luminance": "#c88840",   # warm amber
+    "red":       "#b65c5c",   # desaturated brick
+    "count":     "#7060a0",   # muted purple
+    "pattern":   "#508080",   # muted teal
+}
+CLASS_CMAPS = {
+    cls: LinearSegmentedColormap.from_list(cls, ["#ffffff", color])
+    for cls, color in CLASS_COLORS.items()
+}
+PASS_COLOR = "#1a7f3c"
+FAIL_COLOR = "#a8222b"
+
 
 def render_option_e(result_dict: dict, _video_path: Path, out_path: Path) -> Path:
     """Multi-scale density: each row shows the rolling fraction of frames
@@ -462,6 +478,410 @@ def _empty_png(out_path: Path, message: str) -> Path:
     ax.text(0.5, 0.5, message, ha="center", va="center",
             fontsize=12, color="#888")
     ax.axis("off")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+# --- Helpers shared by Options F, G, H ------------------------------------
+
+def _per_class_severity_series(result_dict: dict, classes: list[str]
+                                 ) -> dict[str, np.ndarray]:
+    """For each class, return a per-frame max-severity timeseries (0 where
+    the class didn't trigger in that frame). Uses region.severity[cls]
+    so we get continuous values, not just on/off."""
+    per_frame = result_dict.get("per_frame", [])
+    n_frames = len(per_frame)
+    out = {cls: np.zeros(n_frames, dtype=np.float32) for cls in classes}
+    for fi, f in enumerate(per_frame):
+        for region in f.get("hazard_regions", []):
+            for cls, sev in (region.get("severity") or {}).items():
+                if cls in out and sev > out[cls][fi]:
+                    out[cls][fi] = float(sev)
+    return out
+
+
+def _per_class_presence_series(result_dict: dict, classes: list[str]
+                                 ) -> dict[str, np.ndarray]:
+    """For each class, return a per-frame binary indicator (1 = at least
+    one region triggered that class in that frame)."""
+    per_frame = result_dict.get("per_frame", [])
+    n_frames = len(per_frame)
+    out = {cls: np.zeros(n_frames, dtype=np.int32) for cls in classes}
+    for fi, f in enumerate(per_frame):
+        for region in f.get("hazard_regions", []):
+            for cls in region.get("classes", []):
+                if cls in out:
+                    out[cls][fi] = 1
+    return out
+
+
+def _present_classes(result_dict: dict) -> list[str]:
+    """Classes that appear anywhere in this result. Falls back to a
+    default pair so empty results still render a recognisable chart."""
+    seen: set[str] = set()
+    for f in result_dict.get("per_frame", []):
+        for region in f.get("hazard_regions", []):
+            seen.update(region.get("classes", []))
+    # Always at least show luminance + red so a clean PASS still produces
+    # a chart that says "all classes PASS" instead of being empty.
+    seen.update({"luminance", "red"})
+    # Preserve a consistent ordering across charts.
+    canonical = [c for c in ("luminance", "red", "pattern", "count") if c in seen]
+    return canonical
+
+
+def _verdict_chip(ax, text: str, color: str, x: float = 0.0, y: float = 1.04) -> None:
+    """Place a colored PASS/FAIL chip near the top-left of an axes."""
+    ax.text(x, y, text, transform=ax.transAxes, fontsize=11,
+            fontweight="bold", color="white",
+            bbox=dict(facecolor=color, alpha=1.0, edgecolor="none",
+                       pad=4, boxstyle="round,pad=0.4"))
+
+
+# --- Option F: per-class multi-scale density ------------------------------
+
+def render_option_f(result_dict: dict, _video_path: Path, out_path: Path) -> Path:
+    """Per-class flame chart: one band per hazard class, each band shows
+    rolling hazard density at three temporal windows (33ms / 333ms / 1s).
+    Each class-band has its own colormap so the bands are visually
+    distinct without spatial overlap. Verdict label per class is colored
+    PASS-green or FAIL-red so a single-blip FAIL is unmissable."""
+    per_frame = result_dict.get("per_frame", [])
+    fps = float(result_dict.get("fps", 0.0)) or 1.0
+    n_frames = len(per_frame)
+    if n_frames == 0:
+        return _empty_png(out_path, "Option F: no data")
+    duration = n_frames / fps
+    failed_dims = set(result_dict.get("failed_dimensions") or [])
+    overall_verdict = result_dict.get("verdict", "?")
+    classes = _present_classes(result_dict)
+    presence = _per_class_presence_series(result_dict, classes)
+
+    windows_s = [w for w in (1 / 30, 1 / 3, 1.0) if w <= duration]
+    if not windows_s:
+        windows_s = [1 / fps]
+
+    fig, axes = plt.subplots(
+        len(classes), 1,
+        figsize=(max(8.5, duration * 1.6),
+                 max(2.8, 1.4 * len(classes) + 0.5)),
+        squeeze=False, sharex=True,
+    )
+    for ai, cls in enumerate(classes):
+        ax = axes[ai, 0]
+        cum = np.concatenate([[0], np.cumsum(presence[cls])])
+        rows = []
+        for W in windows_s:
+            W_frames = max(1, int(round(W * fps)))
+            starts = np.maximum(0, np.arange(n_frames) - W_frames + 1)
+            counts = cum[np.arange(n_frames) + 1] - cum[starts]
+            rows.append(counts.astype(np.float32) / W_frames)
+        rows_stacked = np.stack(list(reversed(rows)))
+        cmap = CLASS_CMAPS.get(cls, _SOFTGREY_CMAP)
+        ax.imshow(rows_stacked, aspect="auto",
+                   extent=[0.0, duration, len(rows_stacked) - 0.5, -0.5],
+                   cmap=cmap, vmin=0.0, vmax=1.0,
+                   interpolation="bilinear")
+
+        class_failed = cls in failed_dims
+        chip_color = FAIL_COLOR if class_failed else PASS_COLOR
+        chip_text = f"{cls.upper()}: {'FAIL' if class_failed else 'PASS'}"
+        _verdict_chip(ax, chip_text, chip_color)
+
+        def _label(w: float) -> str:
+            return f"{w * 1000:.0f}ms" if w < 1 else f"{w:.1f}s"
+        ax.set_yticks(range(len(rows_stacked)))
+        ax.set_yticklabels([_label(w) for w in reversed(windows_s)],
+                            fontsize=8)
+        ax.set_ylabel("window", fontsize=9)
+        for y in range(len(rows_stacked) - 1):
+            ax.axhline(y + 0.5, color=SAFE_GRID_COLOR, linewidth=0.4)
+    axes[-1, 0].set_xlabel("time (s)")
+
+    overall_color = FAIL_COLOR if overall_verdict == "FAIL" else PASS_COLOR
+    fig.suptitle(f"Option F -- per-class multi-scale density "
+                  f"(overall: {overall_verdict})",
+                  color=overall_color, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+# --- Option G: per-class severity line plot -------------------------------
+
+def render_option_g(result_dict: dict, _video_path: Path, out_path: Path) -> Path:
+    """Per-class severity over time as line plot. Y = peak windowed
+    count / threshold for that class; X = time. Horizontal dashed line
+    at y=1 marks the threshold. Above-threshold region for each line is
+    shaded in the class color so single-blip FAILs are loudly visible.
+    Verdict chip per class in the legend."""
+    per_frame = result_dict.get("per_frame", [])
+    fps = float(result_dict.get("fps", 0.0)) or 1.0
+    n_frames = len(per_frame)
+    if n_frames == 0:
+        return _empty_png(out_path, "Option G: no data")
+    duration = n_frames / fps
+    failed_dims = set(result_dict.get("failed_dimensions") or [])
+    overall_verdict = result_dict.get("verdict", "?")
+    classes = _present_classes(result_dict)
+    severity = _per_class_severity_series(result_dict, classes)
+    times = np.arange(n_frames) / fps
+
+    fig, ax = plt.subplots(figsize=(max(8.5, duration * 1.6), 4.5))
+    ymax_data = max(
+        (s.max() for s in severity.values()), default=1.0)
+    ymax = max(2.0, float(ymax_data) * 1.1)
+
+    # Highlight every above-threshold region in light red for "danger zone"
+    # then draw per-class lines on top.
+    ax.axhspan(1.0, ymax, color="#fce8e8", alpha=0.5, zorder=0)
+    ax.axhline(1.0, color="#a8222b", linestyle="--", linewidth=1.2,
+                label="threshold (FAIL line)")
+    for cls in classes:
+        color = CLASS_COLORS.get(cls, "#888")
+        sev = severity[cls]
+        class_failed = cls in failed_dims
+        suffix = " FAIL" if class_failed else " PASS"
+        ax.plot(times, sev, color=color, linewidth=2.2,
+                 label=f"{cls}{suffix}", zorder=2)
+        above = sev >= 1.0
+        if above.any():
+            ax.fill_between(times, 1.0, sev, where=above,
+                             color=color, alpha=0.45, zorder=1)
+            # Also mark each fail moment with a small triangle so a 1-frame
+            # blip can't be missed: a thin spike line.
+            fail_idx = np.where(above)[0]
+            if len(fail_idx) > 0:
+                # Draw a thin vertical line at each fail frame, capped at
+                # the peak severity
+                for i in fail_idx:
+                    ax.vlines(times[i], 1.0, sev[i], color=color,
+                                linewidth=0.5, alpha=0.6, zorder=1)
+    ax.set_xlim(0, duration)
+    ax.set_ylim(0, ymax)
+    ax.set_xlabel("time (s)")
+    ax.set_ylabel("severity (peak count / threshold;  1.0 = FAIL line)")
+    ax.grid(True, axis="y", alpha=0.3)
+
+    overall_color = FAIL_COLOR if overall_verdict == "FAIL" else PASS_COLOR
+    ax.set_title(f"Option G -- per-class severity over time "
+                  f"(overall: {overall_verdict})",
+                  color=overall_color, fontweight="bold")
+    leg = ax.legend(loc="upper right", framealpha=0.95, fontsize=9)
+    # Color FAILing legend entries red, PASSing entries green
+    for text in leg.get_texts():
+        if "FAIL" in text.get_text():
+            text.set_color(FAIL_COLOR)
+            text.set_fontweight("bold")
+        elif "PASS" in text.get_text():
+            text.set_color(PASS_COLOR)
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+# --- Option H: per-class Gantt rows ---------------------------------------
+
+def render_option_h(result_dict: dict, _video_path: Path, out_path: Path) -> Path:
+    """One row per hazard class; each fail interval drawn as a continuous
+    bar in that class's row. Light tint behind any FAILing class makes
+    even a one-frame interval unmissable. Class verdict + peak severity
+    + interval count on the left so a viewer can never mistake a single
+    blip for "no big deal."""
+    duration = float(result_dict.get("n_frames", 0)) / max(
+        float(result_dict.get("fps", 0.0)) or 1.0, 0.001)
+    failed_dims = set(result_dict.get("failed_dimensions") or [])
+    overall_verdict = result_dict.get("verdict", "?")
+    classes = _present_classes(result_dict)
+    per_axis = result_dict.get("per_axis") or {}
+
+    fig, ax = plt.subplots(
+        figsize=(max(9.0, duration * 1.6),
+                 max(2.4, 0.85 * len(classes) + 1.4)),
+    )
+
+    for ai, cls in enumerate(classes):
+        y = len(classes) - 1 - ai
+        info = per_axis.get(cls, {})
+        intervals = info.get("fail_intervals", []) or []
+        color = CLASS_COLORS.get(cls, "#888")
+        class_failed = cls in failed_dims
+
+        # Background tint for failing classes -- impossible to miss.
+        if class_failed:
+            ax.axhspan(y - 0.45, y + 0.45, color=color, alpha=0.10)
+
+        # Minimum bar width so a one-frame interval still draws visibly.
+        min_bar_width = max(duration * 0.012, 1 / max(
+            float(result_dict.get("fps", 0.0)) or 1.0, 1.0))
+        for start, end in intervals:
+            width = max(end - start, min_bar_width)
+            ax.barh(y, width, left=start, height=0.55,
+                     color=color, edgecolor=FAIL_COLOR, linewidth=1.2,
+                     zorder=3)
+
+        # Per-class label on the left side of the chart.
+        verdict_text = "FAIL" if class_failed else "PASS"
+        verdict_color = FAIL_COLOR if class_failed else PASS_COLOR
+        peak_sev = info.get("score", 0.0)
+        n_int = len(intervals)
+        if class_failed:
+            sub = (f"sev {peak_sev:.2f}  •  "
+                   f"{n_int} interval{'s' if n_int != 1 else ''}")
+        else:
+            sub = "no intervals above threshold"
+        ax.text(-duration * 0.012, y + 0.18, f"{cls}",
+                va="center", ha="right", fontsize=11,
+                fontweight="bold", color="#222")
+        ax.text(-duration * 0.012, y - 0.18,
+                f"{verdict_text}   {sub}",
+                va="center", ha="right", fontsize=8.5,
+                color=verdict_color,
+                fontweight="bold" if class_failed else "normal")
+
+    ax.set_yticks([])
+    ax.set_xlim(0, max(duration, 0.5))
+    ax.set_ylim(-0.6, len(classes) - 0.4)
+    ax.set_xlabel("time (s)")
+    ax.grid(axis="x", color=SAFE_GRID_COLOR, linewidth=0.5)
+    ax.set_axisbelow(True)
+    overall_color = FAIL_COLOR if overall_verdict == "FAIL" else PASS_COLOR
+    ax.set_title(f"Option H -- per-class fail intervals "
+                  f"(overall: {overall_verdict})",
+                  color=overall_color, fontweight="bold")
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+# --- Option I: per-class swimlanes ----------------------------------------
+
+def _severity_to_alpha(severity: float) -> float:
+    """Map a severity score to a fill alpha. 1.0 (just-FAIL) → 0.45,
+    2.0+ (severe) → 1.0. Keeps a bare-minimum FAIL still visible while
+    making severe events visually heavier."""
+    s = max(1.0, float(severity))
+    return min(1.0, 0.45 + 0.45 * (s - 1.0))
+
+
+def render_option_i(result_dict: dict, _video_path: Path, out_path: Path) -> Path:
+    """Per-class swimlane chart. Each hazard class is a horizontal lane
+    with:
+      * a left header strip containing the class name + PASS/FAIL chip +
+        summary (peak severity, interval count)
+      * a right body containing fail intervals drawn as bars on the
+        shared time axis
+    Severity is encoded inside each bar via fill darkness so the bar
+    height stays uniform (visually quiet) but a severe event reads as
+    heavier than a marginal one. Lanes are separated by strong dividers
+    and lightly class-tinted backgrounds.
+
+    PSE-safety: no flicker possible (bars are continuous spans); class
+    backgrounds and bars are muted, no saturated hues; lane dividers are
+    horizontal not vertical, so no chance of a striped pattern.
+    """
+    duration = float(result_dict.get("n_frames", 0)) / max(
+        float(result_dict.get("fps", 0.0)) or 1.0, 0.001)
+    failed_dims = set(result_dict.get("failed_dimensions") or [])
+    overall_verdict = result_dict.get("verdict", "?")
+    classes = _present_classes(result_dict)
+    per_axis = result_dict.get("per_axis") or {}
+
+    # Layout: header column wide enough for "PEAK SEVERITY x.xx" + chip,
+    # body fills the rest.
+    n_lanes = len(classes)
+    fig = plt.figure(figsize=(max(11.5, duration * 1.6 + 2.5),
+                                max(2.6, 1.0 * n_lanes + 1.0)))
+    gs = fig.add_gridspec(1, 2, width_ratios=[1.0, 3.2], wspace=0.02)
+    ax_head = fig.add_subplot(gs[0, 0])
+    ax_body = fig.add_subplot(gs[0, 1], sharey=None)
+
+    # --- Left: headers ---
+    ax_head.set_xlim(0, 1)
+    ax_head.set_ylim(-0.5, n_lanes - 0.5)
+    ax_head.set_xticks([]); ax_head.set_yticks([])
+    for spine in ax_head.spines.values():
+        spine.set_visible(False)
+    for ai, cls in enumerate(classes):
+        y = n_lanes - 1 - ai
+        info = per_axis.get(cls, {})
+        intervals = info.get("fail_intervals", []) or []
+        peak_sev = float(info.get("score", 0.0))
+        class_failed = cls in failed_dims
+        chip_color = FAIL_COLOR if class_failed else PASS_COLOR
+        chip_text = f"{cls.upper()}: {'FAIL' if class_failed else 'PASS'}"
+        # Lane background tint extends into the header for visual continuity
+        # with the body lane.
+        lane_color = CLASS_COLORS.get(cls, "#888")
+        ax_head.axhspan(y - 0.45, y + 0.45, color=lane_color, alpha=0.07)
+        # Chip
+        ax_head.text(0.05, y + 0.18, chip_text,
+                      va="center", ha="left",
+                      fontsize=10.5, fontweight="bold", color="white",
+                      bbox=dict(facecolor=chip_color, edgecolor="none",
+                                 pad=4, boxstyle="round,pad=0.4"))
+        # Summary line under the chip
+        if class_failed:
+            sub = f"peak severity {peak_sev:.2f}  •  {len(intervals)} interval{'s' if len(intervals) != 1 else ''}"
+        else:
+            sub = "no intervals above threshold"
+        ax_head.text(0.05, y - 0.25, sub,
+                      va="center", ha="left",
+                      fontsize=8.5, color="#555")
+
+    # --- Right: lane bodies ---
+    ax_body.set_xlim(0, max(duration, 0.5))
+    ax_body.set_ylim(-0.5, n_lanes - 0.5)
+    ax_body.set_yticks([])
+    ax_body.set_xlabel("time (s)")
+    ax_body.grid(axis="x", color=SAFE_GRID_COLOR, linewidth=0.5)
+    ax_body.set_axisbelow(True)
+
+    # Per-axis severity timeseries so we can darken the bar at its peak.
+    severity = _per_class_severity_series(result_dict, classes)
+
+    min_bar_width = max(duration * 0.012,
+                         1 / max(float(result_dict.get("fps", 0.0)) or 1.0, 1.0))
+
+    for ai, cls in enumerate(classes):
+        y = n_lanes - 1 - ai
+        info = per_axis.get(cls, {})
+        intervals = info.get("fail_intervals", []) or []
+        class_failed = cls in failed_dims
+        lane_color = CLASS_COLORS.get(cls, "#888")
+        ax_body.axhspan(y - 0.45, y + 0.45, color=lane_color, alpha=0.07)
+
+        sev_series = severity[cls]
+        fps_local = float(result_dict.get("fps", 0.0)) or 1.0
+        for start, end in intervals:
+            width = max(end - start, min_bar_width)
+            i0 = max(0, int(start * fps_local))
+            i1 = min(len(sev_series), max(i0 + 1, int(end * fps_local)))
+            peak_in_interval = float(sev_series[i0:i1].max()) if i1 > i0 else 1.0
+            alpha = _severity_to_alpha(peak_in_interval)
+            ax_body.barh(y, width, left=start, height=0.55,
+                          color=lane_color, alpha=alpha,
+                          edgecolor=FAIL_COLOR, linewidth=1.0, zorder=3)
+        # Severity lives in the header summary, not on every bar -- a
+        # fixture with 50 intervals would otherwise be unreadable.
+
+    # Strong horizontal dividers between lanes (BPMN-style swimlane look).
+    for y in range(n_lanes - 1):
+        ax_body.axhline(y + 0.5, color="#aaa", linewidth=1.0)
+        ax_head.axhline(y + 0.5, color="#aaa", linewidth=1.0)
+
+    overall_color = FAIL_COLOR if overall_verdict == "FAIL" else PASS_COLOR
+    fig.suptitle(f"Option I -- per-class swimlanes (overall: {overall_verdict})",
+                   color=overall_color, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=120, bbox_inches="tight")
     plt.close(fig)
@@ -583,6 +1003,60 @@ OPTION_META = [
         "distinguished -- two simultaneous hazards in different parts of "
         "the frame look the same as one. Pairs naturally with C/D for "
         "the where-info."),
+    ("F", "Per-class multi-scale density",
+        "Like E but rows grouped by class. Three class-bands stacked "
+        "vertically (luminance / red / count), each with its own "
+        "muted colormap (amber / desat-brick / muted-purple). Per-class "
+        "PASS/FAIL chip top-left of each band.",
+        "Densest information per pixel. Class differentiation via row "
+        "position <i>and</i> colormap. Verdict chip is unmissable: a "
+        "FAIL class shows a red chip even if its data band is otherwise "
+        "near-empty.",
+        "More vertical real estate per chart. Multi-class fixtures get "
+        "tall."),
+    ("G", "Per-class severity line",
+        "Multi-line plot. Y = severity ratio (peak count / threshold for "
+        "that class). X = time. Lines colored by class. Horizontal "
+        "dashed line at y=1.0 = FAIL line. Above-1.0 region tinted "
+        "light red as the 'danger zone'; per-line above-threshold area "
+        "filled in the class colour. Each FAIL frame additionally drawn "
+        "as a thin spike so single-blip FAILs are loudly visible.",
+        "Most direct answer to 'when temporally are the risks?' Severity "
+        "is on the y-axis, time on the x-axis, class via colour. Anyone "
+        "with statistics-chart literacy parses it in seconds. Threshold "
+        "line + danger-zone shading + per-frame spikes make it impossible "
+        "to read a brief excursion above 1.0 as harmless.",
+        "Lines can occlude each other if multiple classes peak at the "
+        "same moments. Less visually striking than F."),
+    ("I", "Per-class swimlanes",
+        "BPMN-style swimlane diagram. Each hazard class gets its own "
+        "horizontal lane with a header strip on the left (class name + "
+        "PASS/FAIL chip + summary) and a wide body on the right where "
+        "fail intervals are drawn as bars on the shared time axis. "
+        "Lanes are visually separated by strong dividers and lightly "
+        "class-tinted backgrounds. Severity encoded inside each bar "
+        "via fill darkness (1.0 = light, 2.0+ = saturated).",
+        "Reads instantly: each class's behaviour is a self-contained "
+        "lane. Lane backgrounds + verdict chips make a FAIL in any lane "
+        "impossible to miss; lanes that PASS clearly say so. Severity "
+        "encoded inside the bars recovers the magnitude info that plain "
+        "Gantt loses. Most polished single-pane shape.",
+        "Loses temporal-density detail at the sub-bar level (a long bar "
+        "doesn't say whether the class was continuously hazardous or "
+        "just had peaks). For that, pair with F or E."),
+    ("H", "Per-class Gantt rows",
+        "Y = hazard classes (one row per class). X = time. Each fail "
+        "interval drawn as a continuous bar in that class's row. Light "
+        "background tint behind any FAILing class; minimum bar width "
+        "applied so a one-frame interval still draws visibly; class "
+        "label on the left side shows PASS/FAIL + peak severity + "
+        "interval count.",
+        "Quietest of the three. Reads at a glance. Class differentiation "
+        "via row position. Background tint makes 'this class FAILed' "
+        "impossible to miss even if the interval is one frame wide.",
+        "Loses severity magnitude (a slightly-above-threshold blip looks "
+        "identical to a 3x-threshold sustained event). Pair with G for "
+        "magnitude information."),
 ]
 
 
@@ -607,6 +1081,10 @@ def main() -> int:
             "C": render_option_c,
             "D": render_option_d,
             "E": render_option_e,
+            "F": render_option_f,
+            "G": render_option_g,
+            "H": render_option_h,
+            "I": render_option_i,
         }[letter]
         rendered: dict[str, Path] = {}
         for name, (path, r) in fixture_results.items():
