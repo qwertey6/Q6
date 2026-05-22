@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [main]
 
+# Opt into Node.js 24 for JavaScript actions. GitHub deprecates Node.js
+# 20 on 2026-06-02 (~10 days from this commit). Setting the flag now
+# avoids a silent break next week and is the change GitHub itself
+# recommends in the deprecation notice.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   detector-self-test:
     name: detector self-test + import smoke
