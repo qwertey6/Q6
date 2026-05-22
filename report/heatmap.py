@@ -3,11 +3,17 @@
 Renders a PNG where the x-axis is time and the y-axis is a coarse
 spatial grid (default 3x3 → 9 buckets, listed top-to-bottom,
 left-to-right). Each cell's colour is the peak hazard severity in that
-spatial bucket at that frame, across all hazard classes.
+spatial bucket within a small time window.
 
-Reads a detector ``Result`` (dataclass or dict) and writes a PNG. Used
-to give a one-glance answer to "where and when does this video have
-hazardous regions?"
+**Why this matters for PSE-safe rendering:** a naïve plot with one
+column per video frame reproduces the source's flicker frequency in
+the visualization itself -- a heatmap of a 31 Hz hazardous video
+becomes a 31 Hz stripe pattern, which is the same hazard we're trying
+to warn about. To prevent that, we aggregate frames into wider time
+buckets (default 200 ms, well below 5 Hz) using max-pool, so the
+semantic "this region was hazardous at this time" is preserved without
+inheriting the source's flicker. A subtitle on every rendered chart
+documents the smoothing window so readers know it's intentional.
 
 Bucket order in the y-axis (top→bottom):
   0: top-left      1: top-center     2: top-right
@@ -29,6 +35,12 @@ _BUCKET_LABELS = [
     "mid-L", "mid-C", "mid-R",
     "bot-L", "bot-C", "bot-R",
 ]
+
+# Width of the temporal max-pool bucket. 200 ms keeps any visible
+# alternation in the rendered chart below 5 Hz (worst case: 2.5 Hz),
+# safely below the 3-flash-per-second WCAG count threshold. Reducing
+# this risks the visualization becoming a PSE hazard itself.
+_DEFAULT_BUCKET_MS = 200
 
 
 def _as_dict(obj: Any) -> Any:
@@ -60,7 +72,33 @@ def _bbox_buckets(bbox: tuple[int, int, int, int],
     return out
 
 
-def render_heatmap(result: Any, out_path: Path) -> Path:
+def _max_pool_time(per_frame_heat, fps: float, bucket_ms: int):
+    """Aggregate per-frame heat (shape: N_BUCKETS x n_frames) into wider
+    time buckets via max-pool. Returns (pooled_heat, bucket_duration_s).
+
+    The PSE-safety reason: rendering one column per video frame
+    reproduces the source's flicker frequency in the visualization
+    itself. A 31 Hz hazard video becomes a 31 Hz stripe pattern --
+    the same kind of hazard we're warning about. Pooling to wider
+    time buckets defeats this by guaranteeing visible alternation in
+    the chart stays below ~5 Hz.
+    """
+    import numpy as np
+    if fps <= 0 or per_frame_heat.size == 0:
+        return per_frame_heat, 1.0 / max(fps, 1.0)
+    n_frames = per_frame_heat.shape[1]
+    bucket_dur_s = bucket_ms / 1000.0
+    n_time_buckets = max(1, int(np.ceil(n_frames / (fps * bucket_dur_s))))
+    pooled = np.zeros((per_frame_heat.shape[0], n_time_buckets),
+                       dtype=per_frame_heat.dtype)
+    for fi in range(n_frames):
+        bi = min(int(fi / (fps * bucket_dur_s)), n_time_buckets - 1)
+        np.maximum(pooled[:, bi], per_frame_heat[:, fi], out=pooled[:, bi])
+    return pooled, bucket_dur_s
+
+
+def render_heatmap(result: Any, out_path: Path,
+                     bucket_ms: int = _DEFAULT_BUCKET_MS) -> Path:
     """Render and save the spatial-temporal heatmap. Returns out_path."""
     r = _as_dict(result)
     width = r.get("width", 0)
@@ -75,7 +113,7 @@ def render_heatmap(result: Any, out_path: Path) -> Path:
     import matplotlib.pyplot as plt
 
     n_frames = len(per_frame)
-    heat = np.zeros((N_BUCKETS, n_frames), dtype=np.float32)
+    per_frame_heat = np.zeros((N_BUCKETS, n_frames), dtype=np.float32)
     for fi, f in enumerate(per_frame):
         for region in f.get("hazard_regions", []):
             bbox = tuple(region.get("bbox", (0, 0, 0, 0)))
@@ -84,27 +122,42 @@ def render_heatmap(result: Any, out_path: Path) -> Path:
             if peak_sev <= 0:
                 continue
             for b in _bbox_buckets(bbox, width, height):
-                if peak_sev > heat[b, fi]:
-                    heat[b, fi] = peak_sev
+                if peak_sev > per_frame_heat[b, fi]:
+                    per_frame_heat[b, fi] = peak_sev
 
     fps = float(r.get("fps", 0.0)) or 1.0
     duration = n_frames / fps
+
+    # PSE-safe rendering: max-pool to wider time buckets so the chart
+    # itself can't reproduce the source's flicker frequency.
+    heat, bucket_dur_s = _max_pool_time(per_frame_heat, fps, bucket_ms)
     extent = [0, duration, N_BUCKETS - 0.5, -0.5]
 
     fig, ax = plt.subplots(figsize=(max(8, duration * 1.5), 4.5))
     vmax = max(2.0, float(heat.max()) if heat.size else 1.0)
+    # Sequential colormap with no white→bright-red transition; the bold
+    # bicolour cmaps (hot_r in particular) create high-contrast edges
+    # at hazard onset that read as flicker.
     im = ax.imshow(heat, aspect="auto", extent=extent, origin="upper",
-                    cmap="hot_r", vmin=0.0, vmax=vmax, interpolation="nearest")
+                    cmap="Reds", vmin=0.0, vmax=vmax, interpolation="nearest")
     ax.set_yticks(range(N_BUCKETS))
     ax.set_yticklabels(_BUCKET_LABELS, fontsize=9)
     ax.set_xlabel("time (s)")
     ax.set_ylabel("spatial bucket (3x3 grid)")
     ax.set_title(f"Q6 — {r.get('verdict','?')} — {Path(r.get('profile_name','?')).name} "
                   f"— score {r.get('score', 0.0):.3f}", fontsize=11)
+    # Footer noting the PSE-safe smoothing.
+    ax.text(0.0, -0.18,
+            f"chart temporally aggregated to {bucket_ms} ms buckets "
+            f"(max-pool) so the visualization itself stays below ~5 Hz "
+            f"and does not reproduce the source's flicker frequency",
+            transform=ax.transAxes, fontsize=8, color="#666",
+            verticalalignment="top")
 
-    # Horizontal grid lines between rows of the 3x3.
+    # Horizontal grid lines between rows of the 3x3 (also de-emphasised
+    # to avoid creating their own visual flicker against the colormap).
     for y in (2.5, 5.5):
-        ax.axhline(y, color="#888", linewidth=0.5, linestyle="--")
+        ax.axhline(y, color="#bbb", linewidth=0.4, linestyle="--")
 
     cbar = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
     cbar.set_label("peak severity (≥1 = FAIL)")
