@@ -1,5 +1,10 @@
 # Exact pins. Any change here can flip a near-threshold PSE verdict.
 # Keep in sync with environment.lock.
+#
+# PyTorch is intentionally NOT pinned here -- it's installed separately
+# by the CI workflow (CPU wheel) and by users (their choice of CPU /
+# CUDA / MPS wheel) to avoid pulling ~700 MB by default. The detector
+# imports torch at runtime; install via `pip install torch` before use.
 opencv-python==4.10.0.84
 numpy==1.26.4
 Pillow==10.4.0
@@ -7,11 +12,8 @@ imageio==2.34.2
 imageio-ffmpeg==0.5.1
 jsonschema==4.23.0
 
-# JAX is used by the detector for jit-compiled per-frame compute. CPU
-# backend is the working one today; jax-metal is experimental and was
-# observed to fail at module import on Apple M4 Max -- if you want to
-# try GPU acceleration on a supported NVIDIA system, install jax[cuda]
-# or jax[cuda12-pip] separately. Pin both jax and jaxlib together --
-# they're tightly coupled.
-jax==0.10.1
-jaxlib==0.10.1
+# Reporting + ML adapters. Required for `report/` (HTML + swimlane
+# charts), the `flicker_filter` baseline adapter, and the A1-A6 ML
+# experiment scripts. Not strictly required by the detector itself.
+matplotlib==3.9.2
+scikit-learn==1.5.2
