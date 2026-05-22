@@ -1,0 +1,58 @@
+# Citation metadata for Q6, conforming to the Citation File Format (CFF)
+# 1.2.0 specification: https://citation-file-format.github.io/
+#
+# GitHub reads this file to populate the "Cite this repository" button in
+# the right sidebar of the repo page. Visitors can copy a generated APA,
+# BibTeX, RIS, or EndNote entry directly.
+#
+# When you eventually publish a preprint / paper / Zenodo release, add a
+# `preferred-citation:` block below pointing at the canonical academic
+# reference, and the citation widget will offer that one instead of the
+# software entry.
+
+cff-version: 1.2.0
+message: "If you use Q6 in your work, please cite it as below."
+
+title: "Q6: Standards-Grounded Photosensitive-Epilepsy Detection Benchmark"
+abstract: >-
+  Q6 is a reproducible cross-tool, cross-standards benchmark for
+  photosensitive-epilepsy (PSE) detection in video, paired with a
+  detector implemented from the text of the standards (WCAG 2.2
+  SC 2.3.1, Trace24, ITU-R BT.1702, Ofcom GN2 Annex 1, NAB-J, ISO
+  9241-391). The harness enforces adapter / label isolation in code
+  so the benchmark is non-gameable; per-fixture HTML reports include
+  spatial-temporal swimlanes, hazard regions, mitigation hints, and
+  standards-clause citations.
+
+type: software
+version: "0.2.0"
+date-released: "2026-05-22"
+license: PolyForm-Noncommercial-1.0.0
+
+repository-code: "https://github.com/qwertey6/Q6"
+url: "https://github.com/qwertey6/Q6"
+
+authors:
+  - family-names: "Kaplan"
+    given-names: "Jacob T."
+    email: "qwertey6@gmail.com"
+    # Add your free ORCID iD here once registered (orcid.org, 5 min).
+    # orcid: "https://orcid.org/0000-0000-0000-0000"
+    # Add an institutional affiliation here if/when one applies.
+    # affiliation: ""
+
+keywords:
+  - photosensitive epilepsy
+  - PSE
+  - WCAG 2.2 SC 2.3.1
+  - Trace24
+  - ITU-R BT.1702
+  - Ofcom GN2
+  - NAB-J
+  - ISO 9241-391
+  - accessibility
+  - video analysis
+  - flash detection
+  - photosensitive seizure
+  - benchmark
+  - Harding test
