@@ -1,27 +1,39 @@
-"""detector/core.py -- PyTorch-accelerated PSE detector.
+"""detector/core.py -- Q6's standards-grounded PSE detector.
 
-PyTorch port of the classical algorithm, structured to allow direct
-comparison against the JAX version on `main`. The algorithm is
-identical (region-mean ΔL via CC on cv2/numpy, anchor-based darker
-bound, no-reset-on-fail, incremental sliding window); only the tensor
-framework changes.
+Implements per-frame photosensitive-epilepsy hazard detection from the
+text of the standards (WCAG 2.2 SC 2.3.1, Trace24, ITU-R BT.1702, Ofcom
+GN2 Annex 1, NAB-J, ISO 9241-391). Every numeric threshold is justified
+in detector/THRESHOLDS.md by a clause citation; nothing is tuned against
+benchmark labels.
 
-Backend selection: MPS on Apple Silicon (M-series), CUDA on NVIDIA, CPU
-elsewhere. PyTorch's MPS backend is materially more mature than
-jax-metal (the JAX Apple-GPU backend currently fails at module import
-on the M4 Max), which is the main reason this branch exists -- to find
-out whether we can get useful GPU acceleration that JAX couldn't give
-us today.
+Entry point: ``analyze(video_path, profile, cc_backend=None) -> Result``.
 
-Pipeline shape (same as JAX version):
+Architecture (per frame):
+
   numpy uint8 frame
-    -> torch.from_numpy + .to(DEVICE)
-    -> srgb_to_relative_luminance via 256-entry LUT
-    -> saturated_red
-    -> [numpy] regional_delta via cv2 connected components
-    -> axis_step (accumulator + anchor gate + reset)
-    -> incremental window count update
-    -> [numpy/cv2] hazard CC -- only when the cheap max-check fires
+    → torch tensor on auto-selected device (MPS / CUDA / CPU)
+    → relative-luminance map L (sRGB via 256-entry LUT) + saturated-red map R
+    → region-mean ΔL on both channels (via the CCBackend, cv2 by default)
+    → per-axis state update (accumulator + anchor-based WCAG darker-bound
+      gate + no-reset-on-fail sequencing -- see THRESHOLDS.md OQ-5)
+    → incremental 1-second windowed transition counts
+    → hazard-region extraction (union-CC, per-region class tagging,
+      severity / mitigation / counterfactual)
+
+Each frame emits PerFrame.hazard_regions (list[HazardRegion]) with bbox,
+classes, severity, mitigation hints, and standards-clause citations. At
+fixture level, Result carries the verdict + a continuous severity score
++ per-axis aggregates (fail intervals, peak counts, peak areas).
+
+Two CC backends behind a dependency-injection seam (see CCBackend
+section): the cv2-backed default (proven correct, fast), and a
+native-tensor variant (correct on CPU, currently slow on MPS pending
+upstream PyTorch fixes for bincount / unique / roll -- see
+detector/ml/SANITY_CHECKS.md for the diagnostic).
+
+This file is the orchestration layer; the data types, constants, and
+backend implementations live in sibling modules with focused
+responsibilities.
 """
 
 from __future__ import annotations
