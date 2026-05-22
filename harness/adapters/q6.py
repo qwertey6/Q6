@@ -28,6 +28,7 @@ SUPPORTED_PROFILES = [
     "Ofcom-GN2-Annex1",
     "Trace24",
     "NAB-J",
+    "ISO9241-391",
 ]
 PROFILE_AFFECTS_BEHAVIOR = True
 

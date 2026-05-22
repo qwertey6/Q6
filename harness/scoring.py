@@ -46,7 +46,7 @@ KNOWN_STANDARDS = [
     ("itu-r-bt.1702",   "expected_itu_r1702_4",   ("itu-r", "bt.1702", "itu_r1702")),
     ("ofcom-gn2",       "expected_ofcom2017",     ("ofcom",)),
     ("trace24",         "expected_trace24",       ("trace24",)),
-    ("nab-j",           "",                        ("nab-j", "nab_j", "j-ba")),
+    ("nab-j",           "expected_nabj",          ("nab-j", "nab_j", "j-ba")),
     ("iso9241-391",     "expected_iso9241_391",   ("iso9241-391", "iso 9241")),
 ]
 
@@ -62,6 +62,7 @@ PROFILE_TO_STANDARD_SLUG = {
     "Ofcom-GN2-Annex1":  "ofcom-gn2",
     "Trace24":           "trace24",
     "NAB-J":             "nab-j",
+    "ISO9241-391":       "iso9241-391",
 }
 
 

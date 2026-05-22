@@ -121,6 +121,18 @@ PROFILES: dict[str, Profile] = {
                                   area_pixels_limit=_REF_RECT_AREA,
                                   absolute_flashes_per_second_cap=5,
                                   pattern_hazard_enabled=True),
+    # ISO 9241-391: "Ergonomics of human-system interaction -- Part 391:
+    # Requirements, analysis and compliance test methods for the reduction
+    # of photosensitive seizures." Uses Harding-classic-style area
+    # thresholds (10° visual field reference rectangle, 25% threshold
+    # within that field) and the WCAG-shared 0.10 ΔL intensity threshold
+    # and 3-flashes-per-second count limit. We were already shipping
+    # ground-truth labels for this standard (expected_iso9241_391 column
+    # in MANIFEST.csv) but had no detector profile to score them against;
+    # this entry closes that gap.
+    "ISO9241-391":      Profile(name="ISO9241-391",
+                                  area_pixels_limit=_REF_RECT_AREA,
+                                  pattern_hazard_enabled=True),
 }
 
 
