@@ -1,0 +1,48 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  detector-self-test:
+    name: detector self-test + import smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install pytest
+
+      - name: Detector self-test (no corpus needed)
+        env:
+          TORCH_DEVICE: cpu
+        run: |
+          python -m detector --self-test
+
+      - name: Pytest regression panel
+        # Corpus fixtures may not be present in CI -- the regression
+        # panel skips fixtures that aren't materialized. This step
+        # mostly catches import errors and the no-corpus path.
+        env:
+          TORCH_DEVICE: cpu
+        run: |
+          python -m pytest tests/ -v --tb=short
+
+      - name: Verify all detector imports resolve
+        env:
+          TORCH_DEVICE: cpu
+        run: |
+          python -c "from detector import (analyze, Result, PerAxisResult, PerFrame, Profile, PROFILES, HazardRegion, CCBackend, CV2_CC_BACKEND, TENSOR_CC_BACKEND, detect_static_pattern_hazard); print(f'PROFILES: {len(PROFILES)} entries: {sorted(PROFILES)}')"

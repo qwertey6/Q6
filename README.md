@@ -1,5 +1,7 @@
 # Q6 — open PSE-detection benchmark + standards-grounded detector
 
+[![test](https://github.com/qwertey6/Q6/actions/workflows/test.yml/badge.svg)](https://github.com/qwertey6/Q6/actions/workflows/test.yml)
+
 Q6 is a reproducible benchmark for **photosensitive-epilepsy (PSE) detection
 in video**, plus a detector implemented from the *text* of the standards
 (WCAG 2.2 SC 2.3.1, Trace24, ITU-R BT.1702, Ofcom GN2 Annex 1, NAB-J,
