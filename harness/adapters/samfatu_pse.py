@@ -25,6 +25,18 @@ subprocess -- this skips the (irrelevant for us) correction step,
 avoids per-call cold-start, and lets us suppress the tool's verbose
 stdout chatter. ``sys.path`` is augmented at first call to point at
 the pinned local clone under ``corpus/sources/``.
+
+Interpretation note: upstream's WCAG area axis is implemented in
+``PhotosensitivitySafetyEngine/guidelines/w3c.py`` as
+``area_averages_max(x, fragment_shape=(1/3, 1/3), threshold=0.25)``,
+which flags a frame iff at least one non-overlapping 1/3 × 1/3 frame
+cell has >= 25% of its pixels active. On 1920x1080 that's an effective
+~57,600 px floor on contiguous active area, where WCAG-strict (the
+TRACE label reading) puts the floor at ~21,824 px via a sliding 341x256
+reference rectangle -- about 2.6x looser. The tool therefore
+systematically misses small-localized hazards under TRACE's WCAG-strict
+labels. See ``detector/ml/SANITY_CHECKS.md`` Check 5 for the full
+verification and discussion.
 """
 
 from __future__ import annotations

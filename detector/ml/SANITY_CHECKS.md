@@ -125,3 +125,50 @@ After fixing ffmpeg's regex bug, the full per-WCAG-SC2.3.1 picture:
    by design, unlike the classical detector); compared head-to-head
    against the only published ML PSE detector with available source
    (flicker_filter, +0.000).
+
+## Check 5: samfatu_pse / Kaya et al. 2025 (added 2026-05-26)
+
+After integrating the [samfatu/pse-detection-correction](https://github.com/samfatu/pse-detection-correction)
+adapter (per email permission from Prof. Aydın Kaya), the tool scored
+MCC **-0.070** on TRACE WCAG2.2-SC2.3.1 (recall 8.3%, 77 FN / 31 FP).
+Before drawing any conclusion we verified:
+
+  - **Adapter interface**: identical to the calling pattern in
+    upstream's own `epileptic_seizure_engine_test.py` (i.e.,
+    `CustomVideo(path).analyse_video()` → read `.flashes`).
+  - **`speedup` parameter sensitivity**: upstream default is
+    `speedup=10` (downsamples to ~102×76 for analysis). Tested at
+    10 / 4 / 1 -- identical verdicts on every fixture, so downsampling
+    isn't the cause of low recall.
+
+The real driver is in `PhotosensitivitySafetyEngine/guidelines/w3c.py`:
+their `maximumRegion` step uses
+`area_averages_max(x, fragment_shape=(1/3, 1/3), threshold=0.25)` --
+i.e., a frame counts as flashing iff at least one non-overlapping
+1/3 × 1/3 frame cell has ≥25% of its pixels active.
+
+On a 1920×1080 frame, that's an effective floor of **~57,600 px**
+of contiguous activity. WCAG-strict (the reading TRACE labels are
+built from) reads the same clause as a sliding 341×256 reference
+rectangle, putting the floor at **~21,824 px** -- about 2.6× looser.
+
+So:
+  - The MCC -0.070 number is **honest and reproducible** -- it's what
+    their tool does on our corpus, with the interface they expose.
+  - But comparing Kaya head-to-head with Q6 (WCAG-strict) is
+    apples-to-oranges. Their tool implements what we'd call "WCAG-loose"
+    -- closer in spirit to Harding-classic / our `WCAG2.2-classic`
+    profile.
+  - For reference, Q6 itself on our `WCAG2.2-classic` profile (looser
+    area threshold) scores only MCC +0.039 -- so the WCAG-loose
+    interpretation is genuinely a harder configuration to score well
+    on against TRACE's WCAG-strict labels.
+  - We don't have TRACE-style labels for the WCAG-loose reading; if/when
+    we generate them analytically (similar to how we did NAB-J via
+    `corpus/derive_per_standard_labels.py`), we could rescore Kaya more
+    fairly.
+
+Not a wiring bug. A real interpretation difference, documented here so
+the headline number isn't misread as "Kaya's tool is bad" -- the right
+read is "Kaya's tool targets a looser interpretation of WCAG's area
+clause than TRACE labels assume."
