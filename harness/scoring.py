@@ -379,6 +379,7 @@ _DISPLAY_NAMES = {
     "apple_vfr":                "Apple VFR",
     "ffmpeg_photosensitivity":  "FFmpeg vf_photosensitivity",
     "flicker_filter":           "flickerfilter",
+    "samfatu_pse":              "Kaya 2025 (samfatu)",
 }
 
 

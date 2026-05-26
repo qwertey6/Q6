@@ -36,7 +36,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 ADAPTERS = ("q6", "ffmpeg_photosensitivity", "iris", "apple_vfr",
-            "flicker_filter", "q6_mlp")
+            "flicker_filter", "q6_mlp", "samfatu_pse")
 
 
 def _load_adapter(name: str):

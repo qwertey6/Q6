@@ -17,9 +17,19 @@ hash is the pin.
 | `IRIS`           | https://github.com/electronicarts/IRIS      | `d96978ac1107f3463b77f69a9c1b1ec5d45291a0` | 2025-01-14 | BSD-3-Clause | 113 |
 | `VideoFlashingReduction` | https://github.com/apple/VideoFlashingReduction | `7357d2f347c8659cc5ab4804b1338cfb0e95f362` | 2023-05-10 | Apple Sample Code License | 32 |
 | `IRIS-Unreal-Plugin` | https://github.com/electronicarts/IRIS-Unreal-Plugin | `85311532a588d951b833a7b942234bcc9b578bd1` | 2024-11-22 | BSD-3-Clause | 840 |
+| `samfatu_pse-detection-correction` | https://github.com/samfatu/pse-detection-correction | `0dd4eb79441b71ccc88f978d31a6ad1e0bd351b7` | 2025-08-13 | License pending (PR [#9](https://github.com/samfatu/pse-detection-correction/pull/9) opens BSD-3) | 18 |
 
 Each clone preserves its upstream `LICENSE` / `LICENSE.txt` / `LICENSE.md`
 in place. Nothing is modified in `/corpus/sources/`.
+
+The `samfatu_pse-detection-correction` clone is included with explicit
+email permission from Prof. Aydın Kaya (corresponding author of the
+Kaya et al. 2025 SIViP paper), pending merge of our PR adding a
+BSD-3-Clause license file. Two large binary artefacts in the upstream
+(`design_project.exe`, `corrected_video.avi` — 186 MB combined) are
+removed from our local clone after fetch; the detection code in
+`PhotosensitivitySafetyEngine/` and `comparation_engine.py` is what
+the `samfatu_pse` adapter imports.
 
 ## Apple VideoFlashingReduction triplicate verification
 
@@ -87,7 +97,6 @@ the report's Known-but-Excluded table.
 | EA IRIS-Unreal-Plugin | Not headless-runnable; requires Unreal Engine 5 runtime. | Brief §2.1; upstream README. |
 | TRACE D2 PSE analysis tool | **Not yet publicly released** as of 2026-05-19; no source repo published. Re-evaluate at next benchmark run. | https://trace.umd.edu/open-source-photosensitive-epilepsy-analysis-tool/ |
 | Flikcer (FlikcerApp) | Web-app only; no published open-source library entry point; usage flow is interactive upload via flikcerapp.com. | https://flikcerapp.com / Devpost listing. |
-| Kaya, Kilic, Genc & Kural 2025 (SIViP) — implementation at samfatu/pse-detection-correction | Implementation repository did not carry a LICENSE file at probe date; included pending license clarification from the authors. | [Paper](https://link.springer.com/article/10.1007/s11760-025-04608-4) — DOI 10.1007/s11760-025-04608-4 ; [implementation repo](https://github.com/samfatu/pse-detection-correction) (probed 2026-05-19) |
 | USPTO patent "Detection of photosensitive triggers in video content" | Patent, not software. No public implementation. | https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/10742923 |
 
 ## Determinism notes
