@@ -382,6 +382,27 @@ _DISPLAY_NAMES = {
     "samfatu_pse":              "Kaya 2025 (samfatu)",
 }
 
+# Tools whose underlying interpretation of the standard is materially
+# looser than the WCAG-strict reading TRACE labels are derived from.
+# In the LEDE printout we mark these with a dagger and explain via a
+# footnote, so readers don't misread a low MCC as "the tool doesn't
+# work" when it actually means "the tool implements a different
+# reading and we're scoring against the strict reading." See
+# detector/ml/SANITY_CHECKS.md Check 3 (IRIS) + Check 5 (samfatu_pse).
+_INTERPRETATION_CAVEATS = {
+    "iris": (
+        "implements Harding-classic area threshold (~87,296 px); "
+        "TRACE labels assume WCAG-strict (~21,824 px). Looser area "
+        "axis means systematic misses on small-localized hazards."
+    ),
+    "samfatu_pse": (
+        "implements WCAG area axis as '>=25% of any 1/3 × 1/3 frame "
+        "cell' (~57,600 px on 1920x1080); TRACE labels assume "
+        "WCAG-strict's 341x256 reference rectangle (~21,824 px). "
+        "About 2.6x looser; misses small-localized hazards by design."
+    ),
+}
+
 
 def _display_name(tool_at_profile: str) -> str:
     """Convert e.g. 'q6@WCAG2.2-SC2.3.1' → 'Q6 (classical) @ WCAG2.2-SC2.3.1'."""
@@ -478,15 +499,24 @@ def main(argv: list[str]) -> int:
     # Compact human summary on stdout.
     print()
     print("=== LEDE TABLE — upstream peer-reviewed subset ===")
-    print(f"{'tool':32s} {'MCC':>7s} {'F2':>6s} {'AUROC':>6s} "
+    print(f"{'tool':34s} {'MCC':>7s} {'F2':>6s} {'AUROC':>6s} "
           f"{'recall':>7s} {'prec':>6s} {'spec':>6s} {'FN':>4s} {'FP':>4s}")
+    caveats_used: set[str] = set()
     for tool, buckets in scores["per_tool"].items():
         b = buckets.get("source:upstream", {})
         if not b:
             continue
+        # Determine tool key (strip @profile suffix)
+        tool_key = tool.split("@", 1)[0]
         auroc = b.get("auroc")
         display = _display_name(tool)
-        print(f"{display:32s} "
+        # Append dagger if this tool implements a looser interpretation
+        # than TRACE labels assume; we'll explain the dagger in a
+        # footnote so a low MCC doesn't read as "the tool is broken."
+        if tool_key in _INTERPRETATION_CAVEATS:
+            display = display + " †"
+            caveats_used.add(tool_key)
+        print(f"{display:34s} "
               f"{(b.get('mcc') or 0):>+7.3f} "
               f"{(b.get('f2') or 0):>6.3f} "
               f"{(auroc if auroc is not None else 0):>6.3f}{'' if auroc is not None else '*'} "
@@ -494,7 +524,16 @@ def main(argv: list[str]) -> int:
               f"{(b.get('precision') or 0):>6.3f} "
               f"{(b.get('specificity') or 0):>6.3f} "
               f"{b.get('fn', 0):>4d} {b.get('fp', 0):>4d}")
-    print("  (* = AUROC not available; tool emits binary verdicts only)")
+    print()
+    print("  * = AUROC not available; tool emits binary verdicts only")
+    if caveats_used:
+        print("  † = tool implements a looser interpretation of the "
+              "standard than TRACE labels assume:")
+        for tool_key in sorted(caveats_used):
+            print(f"        {_DISPLAY_NAMES.get(tool_key, tool_key)}: "
+                  f"{_INTERPRETATION_CAVEATS[tool_key]}")
+        print("      see detector/ml/SANITY_CHECKS.md for the per-tool "
+              "diagnostic.")
     return 0
 
 

@@ -24,10 +24,24 @@ isolation:
 | **Q6 (classical) @ WCAG2.2**  | +0.220 | 0.537 | 0.615 | 0.587  | 0.654 | 38 | 81 |
 | **Q6 (classical) @ NAB-J**    | +0.329 | 0.487 | 0.707 | **0.882** | 0.770 | **2** | 71 |
 | **Q6 (classical) @ ITU/Ofcom**| +0.387 | 0.568 | 0.644 | 0.750  | 0.826 | 7  | 52 |
-| IRIS @ WCAG2.2                | -0.037 | 0.029 |  —    | 0.024  | 0.961 | 82 |  9 |
+| IRIS @ WCAG2.2 †              | -0.037 | 0.029 |  —    | 0.024  | 0.961 | 82 |  9 |
 | FFmpeg `vf_photosensitivity`  | -0.067 | 0.118 | 0.527 | 0.107  | 0.839 | 75 | 37 |
+| Kaya 2025 (samfatu) @ WCAG2.2 † | -0.070 | 0.094 | 0.472 | 0.083 | 0.865 | 77 | 31 |
+| Q6 (MLP) @ WCAG2.2            | -0.090 | 0.285 | 0.488 | 0.310  | 0.591 | 58 | 94 |
 | flickerfilter (existing ML)   |  0.000 | 0.000 | 0.495 | 0.000  | 1.000 | 84 |  0 |
 | Apple VFR                     |   —    |  —    |  —    |   —    |   —   |  — |  — (API unreachable in our env) |
+
+**†** marks tools whose underlying interpretation of the WCAG area
+clause is materially looser than the WCAG-strict reading TRACE labels
+assume. IRIS implements Harding-classic (~87,296 px floor on
+contiguous active area); Kaya 2025 reads "any 341×256 rectangle" as
+"any 1/3 × 1/3 frame cell" (~57,600 px floor on 1920×1080). WCAG-strict
+puts the floor at ~21,824 px via a sliding reference rectangle. A low
+MCC under those rows reads as "the tool targets a looser interpretation
+than the labels assume" rather than "the tool is broken." Full
+diagnostic in
+[`detector/ml/SANITY_CHECKS.md`](detector/ml/SANITY_CHECKS.md) Checks 3
+and 5.
 
 A learned detector stacked on Q6's per-frame trace (`A6` in our sweep —
 5-fold CV on TRACE) reaches **MCC +0.355**, a +0.155 absolute lift over
